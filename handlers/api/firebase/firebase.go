@@ -75,9 +75,9 @@ func HandleBatchCommit() http.HandlerFunc {
 		savedItems[data.Writes[0].Update.Name] = data.Writes[0].Update.Fields
 
 		render.JSON(w, r, BatchCommitResponse{
-			CommitTime: time.Now().Format(time.RFC3339),
+			CommitTime: time.Now().UTC().Format(time.RFC3339),
 			WriteResults: []WriteResult{
-				WriteResult{UpdateTime: time.Now().Format(time.RFC3339)},
+				WriteResult{UpdateTime: time.Now().UTC().Format(time.RFC3339)},
 			},
 		})
 		render.Status(r, http.StatusOK)
@@ -109,7 +109,7 @@ func HandleBatchGet() http.HandlerFunc {
 			fmt.Println("missing key")
 			render.JSON(w, r, []BatchGetEmptyResponse{BatchGetEmptyResponse{
 				Missing:  key,
-				ReadTime: time.Now().Format(time.RFC3339),
+				ReadTime: time.Now().UTC().Format(time.RFC3339),
 			}})
 			render.Status(r, http.StatusOK)
 			return
@@ -119,10 +119,10 @@ func HandleBatchGet() http.HandlerFunc {
 			Found: FoundInfoResponse{
 				Name:       key,
 				Fields:     fields,
-				CreateTime: time.Now().Format(time.RFC3339),
-				UpdateTime: time.Now().Format(time.RFC3339),
+				CreateTime: time.Now().UTC().Format(time.RFC3339),
+				UpdateTime: time.Now().UTC().Format(time.RFC3339),
 			},
-			ReadTime: time.Now().Format(time.RFC3339),
+			ReadTime: time.Now().UTC().Format(time.RFC3339),
 		}})
 		render.Status(r, http.StatusOK)
 		return
