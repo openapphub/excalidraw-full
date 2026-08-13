@@ -452,7 +452,7 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]interface{}{"success": false, "error": msg})
 }
 
-func nowISO() string { return time.Now().UTC().Format(time.RFC3339) }
+func nowISO() string { return time.Now().Format(time.RFC3339) }
 
 // num extracts a float from a JSON-decoded numeric field.
 func num(v interface{}) (float64, bool) {

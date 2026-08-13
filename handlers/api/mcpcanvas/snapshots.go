@@ -39,7 +39,7 @@ func (s *Store) handleSnapshotSave(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "failed to marshal canvas")
 		return
 	}
-	createdAt := time.Now().UTC().Format(time.RFC3339)
+	createdAt := time.Now().Format(time.RFC3339)
 	if _, err := s.db.Exec(`INSERT INTO mcp_snapshots (name, elements, created_at) VALUES (?, ?, ?)
 		ON CONFLICT(name) DO UPDATE SET elements = excluded.elements, created_at = excluded.created_at`,
 		body.Name, data, createdAt); err != nil {
