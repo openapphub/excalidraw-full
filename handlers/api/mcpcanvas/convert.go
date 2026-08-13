@@ -48,7 +48,10 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 		base["strokeStyle"] = "solid"
 	}
 	if _, ok := base["roughness"]; !ok {
-		base["roughness"] = 1
+		// Official Excalidraw default is 0 (smooth, non-hand-drawn). The
+		// mcp reference server used 1 (hand-drawn); match the official
+		// look so AI-drawn shapes/arrows render like the editor defaults.
+		base["roughness"] = 0
 	}
 	if _, ok := base["opacity"]; !ok {
 		base["opacity"] = 100
@@ -254,7 +257,7 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 		"x": textX, "y": textY, "width": textW, "height": textH,
 		"angle": 0, "strokeColor": "#1e1e1e", "backgroundColor": "transparent",
 		"fillStyle": "solid", "strokeWidth": 1, "strokeStyle": "solid",
-		"roughness": 1, "opacity": 100, "groupIds": []interface{}{},
+		"roughness": 0, "opacity": 100, "groupIds": []interface{}{},
 		"frameId": nil, "index": "a1", "roundness": nil,
 		"seed": rand.Intn(2147483647), "version": 1,
 		"versionNonce": rand.Intn(2147483647), "isDeleted": false,
