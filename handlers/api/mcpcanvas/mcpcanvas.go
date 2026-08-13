@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -177,6 +178,12 @@ func nativeListToAgentState(elements []map[string]interface{}) *canvasState {
 		state.elements[id] = a
 		state.order = append(state.order, id)
 	}
+	fmt.Printf("[mcpcanvas] load: %d elements, %d boundText, agents=%d\n", len(elements), len(boundText), len(agents))
+	for _, a := range agents {
+		if id, _ := a["id"].(string); id == "rt-note2" || id == "rt-start" {
+			fmt.Printf("[mcpcanvas] load %s: text=%v label=%v\n", id, a["text"], a["label"])
+		}
+	}
 	return state
 }
 
@@ -271,6 +278,7 @@ func (s *Store) create(input map[string]interface{}) map[string]interface{} {
 		st.order = append(st.order, id)
 	}
 	st.elements[id] = el
+	fmt.Printf("[mcpcanvas] create id=%s type=%v text=%v label=%v\n", id, el["type"], el["text"], el["label"])
 	return el
 }
 
@@ -292,6 +300,7 @@ func (s *Store) update(id string, patch map[string]interface{}) (map[string]inte
 	el["updatedAt"] = nowISO()
 	ver, _ := el["version"].(float64)
 	el["version"] = ver + 1
+	fmt.Printf("[mcpcanvas] update id=%s patch_text=%v el_text=%v el_label=%v\n", id, patch["text"], el["text"], el["label"])
 	return el, true
 }
 
@@ -569,7 +578,21 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 	all := s.getAll()
 	cur := s.current
 	s.mu.RUnlock()
+	for _, e := range all {
+		if id, _ := e["id"].(string); id == "rt-note2" {
+			fmt.Printf("[mcpcanvas] list rt-note2 keys=%v text=%v label=%v\n", sortedKeys(e), e["text"], e["label"])
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "elements": all, "count": len(all), "canvasId": cur})
+}
+
+func sortedKeys(m map[string]interface{}) []string {
+	ks := make([]string, 0, len(m))
+	for k := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+	return ks
 }
 
 func (s *Store) handleCreate(w http.ResponseWriter, r *http.Request) {

@@ -117,6 +117,18 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 		if endID == "" {
 			endID, _ = el["endElementId"].(string)
 		}
+		// curl-direct callers often pass start/end as plain strings
+		// ("flow-start") instead of {id: "..."} objects — accept both.
+		if startID == "" {
+			if s, ok := el["start"].(string); ok {
+				startID = s
+			}
+		}
+		if endID == "" {
+			if s, ok := el["end"].(string); ok {
+				endID = s
+			}
+		}
 		if startID != "" {
 			base["startBinding"] = map[string]interface{}{"elementId": startID, "focus": 0, "gap": 4, "fixedPoint": nil}
 		} else if _, ok := base["startBinding"]; !ok {
