@@ -90,7 +90,10 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) initDB() error {
 	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS mcp_snapshots (name TEXT PRIMARY KEY, elements BLOB, created_at DATETIME)`)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.initFilesTable()
 }
 
 // load reads every AI-prefixed canvas from the host `canvases` table and
