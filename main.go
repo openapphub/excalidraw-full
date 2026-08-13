@@ -201,9 +201,6 @@ func setupRouter(store stores.Store) *chi.Mux {
 	r.Route("/api/snapshots", func(r chi.Router) {
 		mcpcanvas.SnapshotRoutes(r, mcStore)
 	})
-	r.Route("/api/comments", func(r chi.Router) {
-		mcpcanvas.CommentRoutes(r, mcStore)
-	})
 	r.Get("/api/files", func(w http.ResponseWriter, r *http.Request) {
 		writeJSONHealth(w, map[string]interface{}{"success": true, "files": map[string]interface{}{}})
 	})
