@@ -4,6 +4,7 @@ import (
 	"math"
 	"math/rand"
 	"time"
+	"unicode/utf8"
 )
 
 // Format conversion between the mcp-excalidraw "agent format" (text/label/
@@ -236,7 +237,7 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 		}
 		midX, _ := num(base["x"])
 		midY, _ := num(base["y"])
-		labelW := math.Max(float64(len(labelText))*10, 60)
+		labelW := math.Max(float64(utf8.RuneCountInString(labelText))*10, 60)
 		textX = midX + lastX/2 - labelW/2
 		textY = midY + lastY/2 - 12
 		textW = labelW
@@ -255,12 +256,14 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 		// Center the label on the container using the *estimated text
 		// size*, not the container size. The frontend may auto-resize the
 		// bound text width to the actual glyph width without recomputing
-		// x, so a container-sized box would render off-center.
+		// x, so a container-sized box would render off-center. CJK glyphs
+		// are ~1em wide (fs), latin ~0.6em — use rune count, not bytes.
 		fs := 16.0
 		if f, ok := num(base["fontSize"]); ok && f > 0 {
 			fs = f
 		}
-		textW = math.Max(float64(len(labelText))*fs*0.6, 20)
+		runes := utf8.RuneCountInString(labelText)
+		textW = math.Max(float64(runes)*fs, 20)
 		textH = fs * 1.25
 		textX = x + w/2 - textW/2
 		textY = y + h/2 - textH/2
