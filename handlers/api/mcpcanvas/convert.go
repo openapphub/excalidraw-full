@@ -252,10 +252,18 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 		if h == 0 {
 			h = 80
 		}
-		textX = x + 10
-		textY = y + h/4
-		textW = w - 20
-		textH = h / 2
+		// Center the label on the container using the *estimated text
+		// size*, not the container size. The frontend may auto-resize the
+		// bound text width to the actual glyph width without recomputing
+		// x, so a container-sized box would render off-center.
+		fs := 16.0
+		if f, ok := num(base["fontSize"]); ok && f > 0 {
+			fs = f
+		}
+		textW = math.Max(float64(len(labelText))*fs*0.6, 20)
+		textH = fs * 1.25
+		textX = x + w/2 - textW/2
+		textY = y + h/2 - textH/2
 	}
 	fs := 16.0
 	if typ == "arrow" || typ == "line" {
