@@ -3,8 +3,6 @@ package openai
 import (
 	"bytes"
 	"encoding/json"
-	"excalidraw-complete/handlers/auth"
-	"excalidraw-complete/middleware"
 	"io"
 	"log"
 	"net/http"
@@ -117,14 +115,6 @@ func (fw *FlusherWriter) Write(p []byte) (int, error) {
 
 func HandleChatCompletion() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Verify user is authenticated
-		_, ok := r.Context().Value(middleware.ClaimsContextKey).(*auth.AppClaims)
-		if !ok {
-			render.Status(r, http.StatusUnauthorized)
-			render.JSON(w, r, map[string]string{"error": "User claims not found"})
-			return
-		}
-
 		if openaiAPIKey == "" {
 			render.Status(r, http.StatusInternalServerError)
 			render.JSON(w, r, map[string]string{"error": "OpenAI API key is not configured on the server"})
@@ -148,8 +138,17 @@ func HandleChatCompletion() http.HandlerFunc {
 			return
 		}
 
-		// Create the proxy request to OpenAI
-		proxyURL := openaiBaseURL + "/v1/chat/completions"
+		// Create the proxy request to OpenAI.
+		// The client may override the target via X-AI-Base-URL (used when the
+		// page is served over http and the AI service is https — the browser
+		// blocks mixed content, so the frontend routes through this proxy and
+		// passes the real target here; the proxy makes the https call
+		// server-side).
+		targetBase := openaiBaseURL
+		if override := r.Header.Get("X-AI-Base-URL"); override != "" {
+			targetBase = override
+		}
+		proxyURL := targetBase + "/chat/completions"
 		proxyReq, err := http.NewRequestWithContext(r.Context(), "POST", proxyURL, bytes.NewReader(body))
 		if err != nil {
 			render.Status(r, http.StatusInternalServerError)

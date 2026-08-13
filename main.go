@@ -157,9 +157,13 @@ func setupRouter(store stores.Store) *chi.Mux {
 					r.Delete("/", kv.HandleDeleteCanvas(store))
 				})
 			})
-			r.Route("/chat", func(r chi.Router) {
-				r.Post("/completions", openai.HandleChatCompletion())
-			})
+		})
+		// AI chat proxy: NOT behind JWT — the client passes its own OpenAI key
+		// (or the server's OPENAI_API_KEY is used server-side); the proxy just
+		// forwards. JWT here would break the mixed-content path (http page ->
+		// https AI target) where the browser can't reach the AI service directly.
+		r.Route("/chat", func(r chi.Router) {
+			r.Post("/completions", openai.HandleChatCompletion())
 		})
 
 		// Old routes for anonymous document sharing
