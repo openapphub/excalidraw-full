@@ -3,9 +3,11 @@ package main
 import (
 	"embed"
 	_ "embed"
+	"encoding/json"
 	"excalidraw-complete/handlers/api/documents"
 	"excalidraw-complete/handlers/api/firebase"
 	"excalidraw-complete/handlers/api/kv"
+	"excalidraw-complete/handlers/api/mcpcanvas"
 	"excalidraw-complete/handlers/api/openai"
 	"excalidraw-complete/handlers/auth"
 	authMiddleware "excalidraw-complete/middleware"
@@ -19,6 +21,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -171,7 +174,46 @@ func setupRouter(store stores.Store) *chi.Mux {
 		r.Get("/callback", auth.HandleCallback)
 	})
 
+	// mcp-excalidraw canvas identity: the CLI refuses to talk to a service
+	// that does not identify itself. No pid is exposed so the CLI's `stop`
+	// can never signal this process (we are the host app, not a disposable
+	// canvas server). /api/files answers 200 with empty files so the CLI's
+	// export never fails on the image-files lookup.
+	mcStore, err := mcpcanvas.NewStore("")
+	if err != nil {
+		logrus.WithError(err).Fatal("failed to init mcpcanvas store")
+	}
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSONHealth(w, map[string]interface{}{
+			"status":         "ok",
+			"timestamp":      time.Now().UTC().Format(time.RFC3339),
+			"elements_count": mcStore.Count(),
+			"service":        mcpcanvas.ServiceName,
+		})
+	})
+	r.Route("/api/elements", func(r chi.Router) {
+		mcpcanvas.Routes(r, mcStore)
+	})
+	r.Route("/api/canvas", func(r chi.Router) {
+		mcpcanvas.CanvasRoutes(r, mcStore)
+	})
+	r.Get("/ws", mcStore.ServeWS)
+	r.Route("/api/snapshots", func(r chi.Router) {
+		mcpcanvas.SnapshotRoutes(r, mcStore)
+	})
+	r.Get("/api/files", func(w http.ResponseWriter, r *http.Request) {
+		writeJSONHealth(w, map[string]interface{}{"success": true, "files": map[string]interface{}{}})
+	})
+	r.Post("/api/files", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
 	return r
+}
+
+func writeJSONHealth(w http.ResponseWriter, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func setupSocketIO() *socketio.Server {

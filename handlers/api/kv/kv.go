@@ -8,6 +8,7 @@ import (
 	"excalidraw-complete/stores"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
@@ -122,7 +123,10 @@ func HandleSaveCanvas(store stores.Store) http.HandlerFunc {
 		canvasName := key // Default to key
 		var canvasThumbnail string
 		if err := json.Unmarshal(bodyCopy, &canvasData); err == nil {
-			if canvasData.AppState.Name != "" {
+			// AI canvases (id prefix "ai-") keep a stable name — ignore the
+			// frontend's auto-generated "无标题-<timestamp>" names, otherwise
+			// every save renames the canvas.
+			if !strings.HasPrefix(key, "ai-") && canvasData.AppState.Name != "" {
 				canvasName = canvasData.AppState.Name
 			}
 			canvasThumbnail = canvasData.Thumbnail
