@@ -21,16 +21,27 @@ func NewHub() *Hub {
 	return &Hub{clients: map[*websocket.Conn]bool{}}
 }
 
-func (h *Hub) Add(conn *websocket.Conn) {
-	h.mu.Lock()
-	h.clients[conn] = true
-	h.mu.Unlock()
-}
-
 func (h *Hub) Remove(conn *websocket.Conn) {
 	h.mu.Lock()
 	delete(h.clients, conn)
 	h.mu.Unlock()
+}
+
+// AddWithInitial 原子注册连接并发送初始场景，保证增量事件不会抢在初始场景之前。
+func (h *Hub) AddWithInitial(conn *websocket.Conn, msg map[string]interface{}) error {
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.clients[conn] = true
+	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		conn.Close()
+		delete(h.clients, conn)
+		return err
+	}
+	return nil
 }
 
 // Broadcast sends a JSON message to all connected clients. Dead connections
@@ -63,37 +74,37 @@ func (s *Store) ServeWS(w http.ResponseWriter, r *http.Request) {
 		logrus.WithError(err).Warn("mcpcanvas: ws upgrade failed")
 		return
 	}
-	s.hub.Add(conn)
 	logrus.Info("mcpcanvas: ws client connected")
 
-	// Send initial scene in native format (frontend renders native elements).
-	// Includes the canvasId so the frontend can sync the right canvas.
-	s.mu.RLock()
-	cur := s.current
-	st := s.canvases[cur]
-	var all []map[string]interface{}
-	if st != nil {
-		all = make([]map[string]interface{}, 0, len(st.order))
-		for _, id := range st.order {
-			all = append(all, st.elements[id])
+	var initErr error
+	func() {
+		// 初始快照生成、连接注册和发送期间保持读锁，避免漏掉并发增量事件。
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		cur := s.current
+		st := s.canvases[cur]
+		var all []map[string]interface{}
+		if st != nil {
+			all = make([]map[string]interface{}, 0, len(st.order))
+			for _, id := range st.order {
+				all = append(all, st.elements[id])
+			}
 		}
-	}
-	s.mu.RUnlock()
-	native := make([]map[string]interface{}, 0, len(all)*2)
-	for _, el := range all {
-		n, textEl := agentToNative(el)
-		native = append(native, n)
-		if textEl != nil {
-			native = append(native, textEl)
+		native := make([]map[string]interface{}, 0, len(all)*2)
+		for _, el := range all {
+			n, textEl := agentToNative(el)
+			native = append(native, n)
+			if textEl != nil {
+				native = append(native, textEl)
+			}
 		}
-	}
-	// Critical: resolve arrow paths BEFORE pushing, exactly like
-	// persistCanvasLocked does. Missing this made WS clients receive
-	// arrows at (0,0) and overwrite the correct scene on load.
-	resolveArrowBindings(native)
-	initMsg := map[string]interface{}{"type": "initial_elements", "canvasId": cur, "elements": native}
-	if data, err := json.Marshal(initMsg); err == nil {
-		_ = conn.WriteMessage(websocket.TextMessage, data)
+		// 推送前必须解析箭头路径，与 persistCanvasLocked 保持一致。
+		resolveArrowBindings(native)
+		initMsg := map[string]interface{}{"type": "initial_elements", "canvasId": cur, "elements": native}
+		initErr = s.hub.AddWithInitial(conn, initMsg)
+	}()
+	if initErr != nil {
+		logrus.WithError(initErr).Debug("mcpcanvas: failed to send initial scene")
 	}
 
 	// Read loop: keep the connection alive, drop on error/close.

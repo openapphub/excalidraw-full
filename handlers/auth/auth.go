@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"excalidraw-complete/core"
@@ -16,8 +17,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/github"
-
-	"encoding/hex"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 )
@@ -160,18 +159,53 @@ func Init() {
 	}
 }
 
-func generateStateOauthCookie(w http.ResponseWriter) string {
+func isSecureRequest(r *http.Request) bool {
+	return r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https"
+}
+
+func generateStateOauthCookie(w http.ResponseWriter, r *http.Request, cookieName string) (string, error) {
 	b := make([]byte, 16)
-	rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
 	state := base64.URLEncoding.EncodeToString(b)
 	cookie := &http.Cookie{
-		Name:     "oauthstate",
+		Name:     cookieName,
 		Value:    state,
+		Path:     "/",
 		Expires:  time.Now().Add(10 * time.Minute),
+		MaxAge:   600,
 		HttpOnly: true,
+		Secure:   isSecureRequest(r),
+		SameSite: http.SameSiteLaxMode,
 	}
 	http.SetCookie(w, cookie)
-	return state
+	return state, nil
+}
+
+func validateOAuthState(r *http.Request, cookieName string) bool {
+	requestState := r.FormValue("state")
+	if requestState == "" {
+		return false
+	}
+	cookie, err := r.Cookie(cookieName)
+	if err != nil || cookie.Value == "" || len(cookie.Value) != len(requestState) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(requestState)) == 1
+}
+
+func clearOAuthStateCookie(w http.ResponseWriter, r *http.Request, cookieName string) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookieName,
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		Expires:  time.Unix(1, 0),
+		HttpOnly: true,
+		Secure:   isSecureRequest(r),
+		SameSite: http.SameSiteLaxMode,
+	})
 }
 
 func HandleGitHubLogin(w http.ResponseWriter, r *http.Request) {
@@ -179,7 +213,11 @@ func HandleGitHubLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GitHub OAuth is not configured", http.StatusInternalServerError)
 		return
 	}
-	state := generateStateOauthCookie(w)
+	state, err := generateStateOauthCookie(w, r, "oauthstate")
+	if err != nil {
+		http.Error(w, "Failed to generate OAuth state", http.StatusInternalServerError)
+		return
+	}
 	url := githubOauthConfig.AuthCodeURL(state)
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
@@ -189,6 +227,12 @@ func HandleGitHubCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "GitHub OAuth is not configured", http.StatusInternalServerError)
 		return
 	}
+	if !validateOAuthState(r, "oauthstate") {
+		clearOAuthStateCookie(w, r, "oauthstate")
+		http.Error(w, "Invalid OAuth state", http.StatusBadRequest)
+		return
+	}
+	clearOAuthStateCookie(w, r, "oauthstate")
 
 	token, err := githubOauthConfig.Exchange(context.Background(), r.FormValue("code"))
 	if err != nil {
@@ -251,25 +295,11 @@ func HandleOIDCLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate random state
-	stateBytes := make([]byte, 16)
-	_, err := rand.Read(stateBytes)
+	state, err := generateStateOauthCookie(w, r, "oidc_state")
 	if err != nil {
 		http.Error(w, "Failed to generate state for OIDC login", http.StatusInternalServerError)
 		return
 	}
-	state := hex.EncodeToString(stateBytes)
-
-	// Set state in a cookie
-	http.SetCookie(w, &http.Cookie{
-		Name:     "oidc_state",
-		Value:    state,
-		Path:     "/",
-		Expires:  time.Now().Add(10 * time.Minute), // 10 minutes expiry
-		HttpOnly: true,
-		Secure:   r.Header.Get("X-Forwarded-Proto") == "https",
-		SameSite: http.SameSiteLaxMode,
-	})
 
 	url := oidcOauthConfig.AuthCodeURL(state, oauth2.AccessTypeOffline)
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
@@ -280,6 +310,12 @@ func HandleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "OIDC is not configured", http.StatusInternalServerError)
 		return
 	}
+	if !validateOAuthState(r, "oidc_state") {
+		clearOAuthStateCookie(w, r, "oidc_state")
+		http.Error(w, "Invalid OAuth state", http.StatusBadRequest)
+		return
+	}
+	clearOAuthStateCookie(w, r, "oidc_state")
 
 	code := r.FormValue("code")
 	if code == "" {

@@ -128,6 +128,24 @@ func handleUI() http.HandlerFunc {
 	}
 }
 
+func handleNotFound() http.HandlerFunc {
+	ui := handleUI()
+	return func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if strings.HasPrefix(path, "/api/") ||
+			strings.HasPrefix(path, "/v0/") ||
+			strings.HasPrefix(path, "/v1/") ||
+			strings.HasPrefix(path, "/auth/") ||
+			path == "/ws" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "API route not found"})
+			return
+		}
+		ui(w, r)
+	}
+}
+
 func setupRouter(store stores.Store) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
@@ -233,31 +251,46 @@ func setupSocketIO() *socketio.Server {
 		Credentials: true,
 	})
 	ioo := socketio.NewServer(nil, opts)
+	sessions := newCollabSessionRegistry()
 
 	ioo.On("connection", func(clients ...any) {
 		socket := clients[0].(*socketio.Socket)
 		me := socket.Id()
 		myRoom := socketio.Room(me)
-		ioo.To(myRoom).Emit("init-room")
-		utils.Log().Println("init room ", myRoom)
+		socket.Emit("init-room")
+		utils.Log().Printf("init room %v\n", myRoom)
 		socket.On("join-room", func(datas ...any) {
-			room := socketio.Room(datas[0].(string))
+			room, clientID, ok := parseJoinRoomData(datas)
+			if !ok {
+				utils.Log().Printf("Socket %v sent invalid join-room payload\n", me)
+				return
+			}
+
+			previousRoom, replacedSocket := sessions.claim(me, room, clientID)
+			if previousRoom != "" && previousRoom != room {
+				socket.Leave(previousRoom)
+			}
 			utils.Log().Printf("Socket %v has joined %v\n", me, room)
 			socket.Join(room)
+			if replacedSocket != "" {
+				utils.Log().Printf(
+					"Socket %v replaces stale socket %v in room %v\n",
+					me,
+					replacedSocket,
+					room,
+				)
+				ioo.In(socketio.Room(replacedSocket)).DisconnectSockets(true)
+			}
 			ioo.In(room).FetchSockets()(func(usersInRoom []*socketio.RemoteSocket, _ error) {
-				if len(usersInRoom) <= 1 {
+				newRoomUsers := socketIDsExcluding(usersInRoom, replacedSocket)
+				if len(newRoomUsers) <= 1 {
 					ioo.To(myRoom).Emit("first-in-room")
 				} else {
 					utils.Log().Printf("emit new user %v in room %v\n", me, room)
 					socket.Broadcast().To(room).Emit("new-user", me)
 				}
 
-				// Inform all clients by new users.
-				newRoomUsers := []socketio.SocketId{}
-				for _, user := range usersInRoom {
-					newRoomUsers = append(newRoomUsers, user.Id())
-				}
-				utils.Log().Println(" room ", room, " has users ", newRoomUsers)
+				utils.Log().Printf("room %v has users %v\n", room, newRoomUsers)
 				ioo.In(room).Emit(
 					"room-user-change",
 					newRoomUsers,
@@ -266,47 +299,79 @@ func setupSocketIO() *socketio.Server {
 			})
 		})
 		socket.On("server-broadcast", func(datas ...any) {
-			roomID := datas[0].(string)
+			if len(datas) < 3 {
+				return
+			}
+			roomID, ok := datas[0].(string)
+			joinedRoom, joined := sessions.roomFor(me)
+			if !ok || !joined || string(joinedRoom) != roomID {
+				utils.Log().Printf("Socket %v attempted broadcast outside its room %v\n", me, roomID)
+				return
+			}
 			utils.Log().Printf(" user %v sends update to room %v\n", me, roomID)
 			socket.Broadcast().To(socketio.Room(roomID)).Emit("client-broadcast", datas[1], datas[2])
 		})
 		socket.On("server-volatile-broadcast", func(datas ...any) {
-			roomID := datas[0].(string)
+			if len(datas) < 3 {
+				return
+			}
+			roomID, ok := datas[0].(string)
+			if !ok {
+				return
+			}
+
+			joinedRoom, joined := sessions.roomFor(me)
+			isMainRoom := joined && string(joinedRoom) == roomID
+			isFollowRoom := strings.HasPrefix(roomID, followRoomPrefix) &&
+				roomID == followRoomPrefix+string(me)
+			if !isMainRoom && !isFollowRoom {
+				utils.Log().Printf("Socket %v attempted volatile broadcast outside its room %v\n", me, roomID)
+				return
+			}
 			utils.Log().Printf(" user %v sends volatile update to room %v\n", me, roomID)
 			socket.Volatile().Broadcast().To(socketio.Room(roomID)).Emit("client-broadcast", datas[1], datas[2])
 		})
 
 		socket.On("user-follow", func(datas ...any) {
-			// TODO()
-
-		})
-		socket.On("disconnecting", func(datas ...any) {
-			for _, currentRoom := range socket.Rooms().Keys() {
-				ioo.In(currentRoom).FetchSockets()(func(usersInRoom []*socketio.RemoteSocket, _ error) {
-					otherClients := []socketio.SocketId{}
-					utils.Log().Printf("disconnecting %v from room %v\n", me, currentRoom)
-					for _, userInRoom := range usersInRoom {
-						if userInRoom.Id() != me {
-							otherClients = append(otherClients, userInRoom.Id())
-						}
-					}
-					if len(otherClients) > 0 {
-						utils.Log().Printf("leaving user, room %v has users  %v\n", currentRoom, otherClients)
-						ioo.In(currentRoom).Emit(
-							"room-user-change",
-							otherClients,
-						)
-
-					}
-
-				})
-
+			if len(datas) == 0 {
+				return
+			}
+			targetID, action, ok := parseUserFollowPayload(datas[0])
+			if !ok || targetID == me || !sessions.sameRoom(me, targetID) {
+				utils.Log().Printf("Socket %v sent invalid user-follow payload\n", me)
+				return
 			}
 
+			followRoom := socketio.Room(followRoomPrefix + string(targetID))
+			switch action {
+			case "FOLLOW":
+				socket.Join(followRoom)
+			case "UNFOLLOW":
+				socket.Leave(followRoom)
+			}
+			emitFollowRoomChange(ioo, followRoom)
+		})
+		socket.On("disconnecting", func(datas ...any) {
+			if room, ok := sessions.roomFor(me); ok {
+				ioo.In(room).FetchSockets()(func(usersInRoom []*socketio.RemoteSocket, err error) {
+					if err != nil {
+						return
+					}
+					otherClients := socketIDsExcluding(usersInRoom, me)
+					utils.Log().Printf("disconnecting %v from room %v\n", me, room)
+					socket.Broadcast().To(room).Emit("room-user-change", otherClients)
+				})
+			}
+
+			for _, currentRoom := range socket.Rooms().Keys() {
+				if _, ok := followTargetFromRoom(currentRoom); ok {
+					emitFollowRoomChange(ioo, currentRoom, me)
+				}
+			}
 		})
 		socket.On("disconnect", func(datas ...any) {
-			socket.RemoveAllListeners("")
-			socket.Disconnect(true)
+			sessions.release(me)
+			utils.Log().Printf("Socket %v disconnected\n", me)
 		})
 	})
 	return ioo
@@ -315,7 +380,7 @@ func setupSocketIO() *socketio.Server {
 
 func waitForShutdown(ioo *socketio.Server) {
 	exit := make(chan struct{})
-	SignalC := make(chan os.Signal)
+	SignalC := make(chan os.Signal, 1)
 
 	signal.Notify(SignalC, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	go func() {
@@ -363,7 +428,7 @@ func main() {
 
 	ioo := setupSocketIO()
 	r.Mount("/socket.io/", ioo.ServeHandler(nil))
-	r.NotFound(handleUI())
+	r.NotFound(handleNotFound())
 
 	logrus.WithField("addr", *listenAddress).Info("starting server")
 	go func() {

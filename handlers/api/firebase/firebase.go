@@ -3,6 +3,7 @@ package firebase
 import (
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -49,7 +50,10 @@ type (
 	}
 )
 
-var savedItems = make(map[string]interface{})
+var (
+	savedItemsMu sync.RWMutex
+	savedItems   = make(map[string]interface{})
+)
 
 func (body *BatchGetRequest) Bind(r *http.Request) (err error) {
 	return nil
@@ -68,21 +72,28 @@ func HandleBatchCommit() http.HandlerFunc {
 		// Seems like requests is text/plain but content is json ...
 		if err := render.DecodeJSON(r.Body, data); err != nil {
 			fmt.Println(err)
-			render.Status(r, http.StatusBadRequest)
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		if len(data.Writes) == 0 {
+			http.Error(w, "writes must not be empty", http.StatusBadRequest)
 			return
 		}
 
-		savedItems[data.Writes[0].Update.Name] = data.Writes[0].Update.Fields
+		now := time.Now().UTC().Format(time.RFC3339)
+		writeResults := make([]WriteResult, len(data.Writes))
+		savedItemsMu.Lock()
+		for i, write := range data.Writes {
+			savedItems[write.Update.Name] = write.Update.Fields
+			writeResults[i] = WriteResult{UpdateTime: now}
+		}
+		savedItemsMu.Unlock()
 
-		render.JSON(w, r, BatchCommitResponse{
-			CommitTime: time.Now().UTC().Format(time.RFC3339),
-			WriteResults: []WriteResult{
-				WriteResult{UpdateTime: time.Now().UTC().Format(time.RFC3339)},
-			},
-		})
 		render.Status(r, http.StatusOK)
-		return
-
+		render.JSON(w, r, BatchCommitResponse{
+			CommitTime:   now,
+			WriteResults: writeResults,
+		})
 	}
 }
 
@@ -97,35 +108,39 @@ func HandleBatchGet() http.HandlerFunc {
 		// Seems like requests is text/plain but content is json ...
 		if err := render.DecodeJSON(r.Body, data); err != nil {
 			fmt.Println(err)
-			render.Status(r, http.StatusBadRequest)
+			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
-		key := data.Documents[0]
-		fmt.Printf("Got key %v \n", key)
-
-		fields, ok := savedItems[key]
-
-		if !ok {
-			fmt.Println("missing key")
-			render.JSON(w, r, []BatchGetEmptyResponse{BatchGetEmptyResponse{
-				Missing:  key,
-				ReadTime: time.Now().UTC().Format(time.RFC3339),
-			}})
-			render.Status(r, http.StatusOK)
+		if len(data.Documents) == 0 {
+			http.Error(w, "documents must not be empty", http.StatusBadRequest)
 			return
 		}
-		fmt.Println("existing key")
-		render.JSON(w, r, []BatchGetExistsResponse{BatchGetExistsResponse{
-			Found: FoundInfoResponse{
-				Name:       key,
-				Fields:     fields,
-				CreateTime: time.Now().UTC().Format(time.RFC3339),
-				UpdateTime: time.Now().UTC().Format(time.RFC3339),
-			},
-			ReadTime: time.Now().UTC().Format(time.RFC3339),
-		}})
+
+		now := time.Now().UTC().Format(time.RFC3339)
+		responses := make([]interface{}, 0, len(data.Documents))
+		savedItemsMu.RLock()
+		for _, key := range data.Documents {
+			fields, ok := savedItems[key]
+			if !ok {
+				responses = append(responses, BatchGetEmptyResponse{
+					Missing:  key,
+					ReadTime: now,
+				})
+				continue
+			}
+			responses = append(responses, BatchGetExistsResponse{
+				Found: FoundInfoResponse{
+					Name:       key,
+					Fields:     fields,
+					CreateTime: now,
+					UpdateTime: now,
+				},
+				ReadTime: now,
+			})
+		}
+		savedItemsMu.RUnlock()
+
 		render.Status(r, http.StatusOK)
-		return
-
+		render.JSON(w, r, responses)
 	}
 }

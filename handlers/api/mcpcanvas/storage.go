@@ -16,27 +16,114 @@ import (
 
 // StoredFile is a row in the files table (Firebase Storage emulator).
 type StoredFile struct {
-	Path        string    `json:"name"`
-	Bucket      string    `json:"bucket"`
-	ContentType string    `json:"contentType"`
-	Size        int64     `json:"size"`
-	CacheControl string   `json:"cacheControl,omitempty"`
-	CreatedAt   time.Time `json:"timeCreated"`
-	UpdatedAt   time.Time `json:"updated"`
+	Path         string    `json:"name"`
+	Bucket       string    `json:"bucket"`
+	ContentType  string    `json:"contentType"`
+	Size         int64     `json:"size"`
+	CacheControl string    `json:"cacheControl,omitempty"`
+	CreatedAt    time.Time `json:"timeCreated"`
+	UpdatedAt    time.Time `json:"updated"`
 }
 
 // initFilesTable creates the files table if it doesn't exist.
 func (s *Store) initFilesTable() error {
 	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS files (
-		path TEXT PRIMARY KEY,
+		path TEXT NOT NULL,
 		bucket TEXT NOT NULL,
 		data BLOB NOT NULL,
 		content_type TEXT DEFAULT 'application/octet-stream',
 		cache_control TEXT DEFAULT '',
 		created_at DATETIME NOT NULL,
-		updated_at DATETIME NOT NULL
+		updated_at DATETIME NOT NULL,
+		PRIMARY KEY (bucket, path)
 	)`)
-	return err
+	if err != nil {
+		return err
+	}
+
+	primaryKey, err := s.filesPrimaryKey()
+	if err != nil {
+		return err
+	}
+	if len(primaryKey) == 2 && primaryKey[0] == "bucket" && primaryKey[1] == "path" {
+		return nil
+	}
+	if len(primaryKey) != 1 || primaryKey[0] != "path" {
+		return fmt.Errorf("unsupported files table primary key: %v", primaryKey)
+	}
+
+	return s.migrateFilesTable()
+}
+
+func (s *Store) filesPrimaryKey() ([]string, error) {
+	rows, err := s.db.Query(`PRAGMA table_info(files)`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	primaryKeyByPosition := make(map[int]string)
+	maxPosition := 0
+	for rows.Next() {
+		var cid, notNull, primaryKeyPosition int
+		var name, columnType string
+		var defaultValue interface{}
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKeyPosition); err != nil {
+			return nil, err
+		}
+		if primaryKeyPosition > 0 {
+			primaryKeyByPosition[primaryKeyPosition] = name
+			if primaryKeyPosition > maxPosition {
+				maxPosition = primaryKeyPosition
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	primaryKey := make([]string, maxPosition)
+	for position, name := range primaryKeyByPosition {
+		primaryKey[position-1] = name
+	}
+	return primaryKey, nil
+}
+
+func (s *Store) migrateFilesTable() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 在同一事务内复制旧数据并替换表，迁移失败时保留原表。
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS files_v2_migration`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`CREATE TABLE files_v2_migration (
+		path TEXT NOT NULL,
+		bucket TEXT NOT NULL,
+		data BLOB NOT NULL,
+		content_type TEXT DEFAULT 'application/octet-stream',
+		cache_control TEXT DEFAULT '',
+		created_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL,
+		PRIMARY KEY (bucket, path)
+	)`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO files_v2_migration
+		(path, bucket, data, content_type, cache_control, created_at, updated_at)
+		SELECT path, bucket, data, content_type, cache_control, created_at, updated_at FROM files`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DROP TABLE files`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`ALTER TABLE files_v2_migration RENAME TO files`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // storageMetadata is the JSON metadata part of the multipart upload body.
@@ -127,7 +214,7 @@ func (s *Store) handleStorageUpload(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	_, err = s.db.Exec(`INSERT INTO files (path, bucket, data, content_type, cache_control, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(path) DO UPDATE SET data=excluded.data, content_type=excluded.content_type,
+		ON CONFLICT(bucket, path) DO UPDATE SET data=excluded.data, content_type=excluded.content_type,
 			cache_control=excluded.cache_control, updated_at=excluded.updated_at`,
 		path, bucket, data, contentType, meta.CacheControl, now, now)
 	if err != nil {

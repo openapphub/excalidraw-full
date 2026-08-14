@@ -70,17 +70,23 @@ func NewStore(dsn string) (*Store, error) {
 	if userID == "" {
 		userID = "github:175949671"
 	}
+	currentCanvasID := strings.TrimSpace(os.Getenv("MCP_CANVAS_ID"))
+	if currentCanvasID == "" {
+		currentCanvasID = DefaultCanvasID
+	}
 	s := &Store{
 		canvases: map[string]*canvasState{},
-		current:  DefaultCanvasID,
+		current:  currentCanvasID,
 		db:       db,
 		userID:   userID,
 		hub:      NewHub(),
 	}
 	if err := s.initDB(); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	if err := s.load(); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
@@ -89,8 +95,20 @@ func NewStore(dsn string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) initDB() error {
-	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS mcp_snapshots (name TEXT PRIMARY KEY, elements BLOB, created_at DATETIME)`)
-	if err != nil {
+	// mcpcanvas 可能在主存储使用 memory 时独立打开 SQLite，因此必须自行建表。
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS canvases (
+		id TEXT NOT NULL,
+		user_id TEXT NOT NULL,
+		name TEXT,
+		thumbnail TEXT,
+		data BLOB,
+		created_at DATETIME,
+		updated_at DATETIME,
+		PRIMARY KEY (user_id, id)
+	)`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS mcp_snapshots (name TEXT PRIMARY KEY, elements BLOB, created_at DATETIME)`); err != nil {
 		return err
 	}
 	return s.initFilesTable()
@@ -103,8 +121,6 @@ func (s *Store) load() error {
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	count := 0
 	for rows.Next() {
 		var id string
 		var data []byte
@@ -117,14 +133,28 @@ func (s *Store) load() error {
 			continue
 		}
 		s.canvases[id] = state
-		count++
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
 	}
 	if _, ok := s.canvases[s.current]; !ok {
-		// current default may not exist yet; pick the first AI canvas if any
-		if len(s.canvases) > 0 {
+		if len(s.canvases) > 0 && strings.TrimSpace(os.Getenv("MCP_CANVAS_ID")) == "" {
+			// 未显式指定画布时，稳定选择已有画布，避免每次启动随机切换。
+			ids := make([]string, 0, len(s.canvases))
 			for id := range s.canvases {
-				s.current = id
-				break
+				ids = append(ids, id)
+			}
+			sort.Strings(ids)
+			s.current = ids[0]
+		} else {
+			// 全新数据库也必须有可写 state，首次创建元素不能解引用 nil。
+			s.canvases[s.current] = newCanvasState()
+			if err := s.persistCanvasLocked(s.current, s.canvases[s.current]); err != nil {
+				return err
 			}
 		}
 	}
@@ -152,7 +182,9 @@ func nativeListToAgentState(elements []map[string]interface{}) *canvasState {
 		typ, _ := e["type"].(string)
 		if typ == "text" {
 			if cid, ok := e["containerId"].(string); ok && cid != "" {
-				boundText[e["id"].(string)] = cid
+				if id, ok := e["id"].(string); ok && id != "" {
+					boundText[id] = cid
+				}
 				continue
 			}
 		}
@@ -195,9 +227,35 @@ func (s *Store) state() *canvasState {
 	return s.canvases[s.current]
 }
 
+func newCanvasState() *canvasState {
+	return &canvasState{elements: map[string]map[string]interface{}{}}
+}
+
+// cloneCanvasState 为持久化失败准备内存回滚快照。调用方必须持有 s.mu。
+func cloneCanvasState(st *canvasState) *canvasState {
+	if st == nil {
+		return nil
+	}
+	cloned := &canvasState{
+		elements: make(map[string]map[string]interface{}, len(st.elements)),
+		order:    append([]string(nil), st.order...),
+	}
+	for id, el := range st.elements {
+		copyEl := make(map[string]interface{}, len(el))
+		for key, value := range el {
+			copyEl[key] = value
+		}
+		cloned.elements[id] = copyEl
+	}
+	return cloned
+}
+
 // persistCanvasLocked writes one canvas back to the host `canvases` table in
 // native format. Caller must hold s.mu.
 func (s *Store) persistCanvasLocked(canvasID string, st *canvasState) error {
+	if st == nil {
+		return fmt.Errorf("canvas %s has no state", canvasID)
+	}
 	native := make([]map[string]interface{}, 0, len(st.order)*2)
 	for _, id := range st.order {
 		el, textEl := agentToNative(st.elements[id])
@@ -259,8 +317,12 @@ func (s *Store) getAll() []map[string]interface{} {
 	return out
 }
 
-func (s *Store) create(input map[string]interface{}) map[string]interface{} {
-	st := s.canvases[s.current]
+func (s *Store) create(canvasID string, input map[string]interface{}) map[string]interface{} {
+	st := s.canvases[canvasID]
+	if st == nil {
+		st = newCanvasState()
+		s.canvases[canvasID] = st
+	}
 	id, _ := input["id"].(string)
 	if id == "" {
 		id = ulid.Make().String()
@@ -285,8 +347,8 @@ func (s *Store) create(input map[string]interface{}) map[string]interface{} {
 	return el
 }
 
-func (s *Store) update(id string, patch map[string]interface{}) (map[string]interface{}, bool) {
-	st := s.canvases[s.current]
+func (s *Store) update(canvasID, id string, patch map[string]interface{}) (map[string]interface{}, bool) {
+	st := s.canvases[canvasID]
 	if st == nil {
 		return nil, false
 	}
@@ -307,8 +369,8 @@ func (s *Store) update(id string, patch map[string]interface{}) (map[string]inte
 	return el, true
 }
 
-func (s *Store) remove(id string) bool {
-	st := s.canvases[s.current]
+func (s *Store) remove(canvasID, id string) bool {
+	st := s.canvases[canvasID]
 	if st == nil {
 		return false
 	}
@@ -325,8 +387,8 @@ func (s *Store) remove(id string) bool {
 	return true
 }
 
-func (s *Store) clearAll() int {
-	st := s.canvases[s.current]
+func (s *Store) clearAll(canvasID string) int {
+	st := s.canvases[canvasID]
 	if st == nil {
 		return 0
 	}
@@ -369,10 +431,15 @@ func (s *Store) ListCanvases() []map[string]interface{} {
 func (s *Store) CreateCanvas() (string, error) {
 	id := AICanvasPrefix + ulid.Make().String()
 	s.mu.Lock()
-	s.canvases[id] = &canvasState{elements: map[string]map[string]interface{}{}}
+	defer s.mu.Unlock()
+	previousCurrent := s.current
+	s.canvases[id] = newCanvasState()
 	s.current = id
 	err := s.persistCanvasLocked(id, s.canvases[id])
-	s.mu.Unlock()
+	if err != nil {
+		delete(s.canvases, id)
+		s.current = previousCurrent
+	}
 	return id, err
 }
 
@@ -394,21 +461,48 @@ func (s *Store) CurrentCanvasID() string {
 	return s.current
 }
 
-// broadcastNative converts agent-format elements to native Excalidraw
-// format (expanding bound text into sibling elements) and broadcasts them
-// with the canvasId so the frontend can filter.
-func (s *Store) broadcastNative(msgType string, agentElements []map[string]interface{}, canvasID string) {
-	native := make([]map[string]interface{}, 0, len(agentElements)*2)
-	for _, el := range agentElements {
-		n, textEl := agentToNative(el)
-		native = append(native, n)
-		if textEl != nil {
-			native = append(native, textEl)
+// mutationCanvasLocked 返回本次写请求的稳定目标。调用方必须持有 s.mu。
+// canvasId 为可选参数，旧版 CLI 不传时仍操作 current。
+func (s *Store) mutationCanvasLocked(r *http.Request) (string, *canvasState, bool) {
+	canvasID := strings.TrimSpace(r.URL.Query().Get("canvasId"))
+	if canvasID == "" {
+		canvasID = s.current
+	}
+	st, ok := s.canvases[canvasID]
+	return canvasID, st, ok
+}
+
+func nativeElementIDs(el map[string]interface{}) []string {
+	native, textEl := agentToNative(el)
+	ids := make([]string, 0, 2)
+	if id, ok := native["id"].(string); ok && id != "" {
+		ids = append(ids, id)
+	}
+	if textEl != nil {
+		if id, ok := textEl["id"].(string); ok && id != "" {
+			ids = append(ids, id)
 		}
 	}
-	// Resolve arrow paths against the full canvas so batch-created arrows
-	// land on the right edges even when their endpoints are in this batch.
-	s.mu.RLock()
+	return ids
+}
+
+func removedElementIDs(before, after []string) []string {
+	remaining := make(map[string]struct{}, len(after))
+	for _, id := range after {
+		remaining[id] = struct{}{}
+	}
+	removed := make([]string, 0, len(before))
+	for _, id := range before {
+		if _, ok := remaining[id]; !ok {
+			removed = append(removed, id)
+		}
+	}
+	return removed
+}
+
+// nativeBroadcastMessageLocked 在锁内生成完整、稳定的广播快照。
+// 单元素事件同时保留 element 旧字段，并通过 elements 同步绑定文字。
+func (s *Store) nativeBroadcastMessageLocked(msgType string, agentElements []map[string]interface{}, canvasID string, removedIDs []string) map[string]interface{} {
 	st := s.canvases[canvasID]
 	var all []map[string]interface{}
 	if st != nil {
@@ -417,8 +511,7 @@ func (s *Store) broadcastNative(msgType string, agentElements []map[string]inter
 			all = append(all, st.elements[id])
 		}
 	}
-	s.mu.RUnlock()
-	full := make([]map[string]interface{}, 0, len(all)*2+len(native))
+	full := make([]map[string]interface{}, 0, len(all)*2)
 	for _, el := range all {
 		n, textEl := agentToNative(el)
 		full = append(full, n)
@@ -426,11 +519,13 @@ func (s *Store) broadcastNative(msgType string, agentElements []map[string]inter
 			full = append(full, textEl)
 		}
 	}
-	full = append(full, native...)
 	resolveArrowBindings(full)
-	resolved := make([]map[string]interface{}, 0, len(native))
-	for _, n := range native {
-		id, _ := n["id"].(string)
+	wantedIDs := make([]string, 0, len(agentElements)*2)
+	for _, el := range agentElements {
+		wantedIDs = append(wantedIDs, nativeElementIDs(el)...)
+	}
+	resolved := make([]map[string]interface{}, 0, len(wantedIDs))
+	for _, id := range wantedIDs {
 		for _, f := range full {
 			if f["id"] == id {
 				resolved = append(resolved, f)
@@ -438,16 +533,22 @@ func (s *Store) broadcastNative(msgType string, agentElements []map[string]inter
 			}
 		}
 	}
+	msg := map[string]interface{}{"type": msgType, "canvasId": canvasID}
+	if len(removedIDs) > 0 {
+		msg["removedElementIds"] = removedIDs
+	}
 	switch msgType {
 	case "element_created", "element_updated":
 		if len(resolved) > 0 {
-			s.hub.Broadcast(map[string]interface{}{"type": msgType, "canvasId": canvasID, "element": resolved[0]})
+			msg["element"] = resolved[0]
+			msg["elements"] = resolved
 		}
 	case "elements_batch_created":
-		s.hub.Broadcast(map[string]interface{}{"type": msgType, "canvasId": canvasID, "elements": resolved})
+		msg["elements"] = resolved
 	case "canvas_cleared":
-		s.hub.Broadcast(map[string]interface{}{"type": msgType, "canvasId": canvasID, "timestamp": nowISO()})
+		msg["timestamp"] = nowISO()
 	}
+	return msg
 }
 
 // --- HTTP helpers ---
@@ -520,22 +621,35 @@ func (s *Store) handleSync(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "canvasId query param is required (protects other canvases from accidental overwrite)")
 		return
 	}
-	s.mu.Lock()
-	if _, ok := s.canvases[target]; !ok {
-		s.mu.Unlock()
+	var (
+		canvasOK   bool
+		persistErr error
+	)
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		previous, ok := s.canvases[target]
+		canvasOK = ok
+		if !ok {
+			return
+		}
+		before := cloneCanvasState(previous)
+		// 将 native 元素转换为 agent 格式，并整体替换指定画布。
+		s.canvases[target] = nativeListToAgentState(body.Elements)
+		if persistErr = s.persistCanvasLocked(target, s.canvases[target]); persistErr != nil {
+			s.canvases[target] = before
+		}
+	}()
+	if !canvasOK {
 		writeErr(w, http.StatusNotFound, "Canvas "+target+" not found")
 		return
 	}
-	// Convert native -> agent, replace the target canvas wholesale
-	s.canvases[target] = nativeListToAgentState(body.Elements)
-	if err := s.persistCanvasLocked(target, s.canvases[target]); err != nil {
-		s.mu.Unlock()
-		writeErr(w, http.StatusInternalServerError, "failed to persist: "+err.Error())
+	if persistErr != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to persist: "+persistErr.Error())
 		return
 	}
 	// Broadcast the full native list so other connected viewers update
 	native := body.Elements
-	s.mu.Unlock()
 	s.hub.Broadcast(map[string]interface{}{"type": "elements_synced", "canvasId": target, "elements": native, "count": len(native)})
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "count": len(native), "canvasId": target})
 }
@@ -609,17 +723,39 @@ func (s *Store) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "element type is required")
 		return
 	}
-	s.mu.Lock()
-	el := s.create(body)
-	cur := s.current
-	if err := s.persistCanvasLocked(cur, s.canvases[cur]); err != nil {
-		s.mu.Unlock()
-		writeErr(w, http.StatusInternalServerError, "failed to persist: "+err.Error())
+	var (
+		cur        string
+		el         map[string]interface{}
+		message    map[string]interface{}
+		canvasOK   bool
+		persistErr error
+	)
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		var st *canvasState
+		cur, st, canvasOK = s.mutationCanvasLocked(r)
+		if !canvasOK {
+			return
+		}
+		before := cloneCanvasState(st)
+		el = s.create(cur, body)
+		if persistErr = s.persistCanvasLocked(cur, s.canvases[cur]); persistErr != nil {
+			s.canvases[cur] = before
+			return
+		}
+		message = s.nativeBroadcastMessageLocked("element_created", []map[string]interface{}{el}, cur, nil)
+	}()
+	if !canvasOK {
+		writeErr(w, http.StatusNotFound, "Canvas "+cur+" not found")
 		return
 	}
-	s.mu.Unlock()
-	s.broadcastNative("element_created", []map[string]interface{}{el}, cur)
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "element": el})
+	if persistErr != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to persist: "+persistErr.Error())
+		return
+	}
+	s.hub.Broadcast(message)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "element": el, "canvasId": cur})
 }
 
 func (s *Store) handleUpdate(w http.ResponseWriter, r *http.Request) {
@@ -629,57 +765,140 @@ func (s *Store) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	s.mu.Lock()
-	el, ok := s.update(id, body)
-	if ok {
-		cur := s.current
-		if err := s.persistCanvasLocked(cur, s.canvases[cur]); err != nil {
-			s.mu.Unlock()
-			writeErr(w, http.StatusInternalServerError, "failed to persist: "+err.Error())
+	var (
+		cur        string
+		el         map[string]interface{}
+		message    map[string]interface{}
+		canvasOK   bool
+		ok         bool
+		persistErr error
+	)
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		var st *canvasState
+		cur, st, canvasOK = s.mutationCanvasLocked(r)
+		if !canvasOK {
 			return
 		}
+		original, exists := st.elements[id]
+		if !exists {
+			return
+		}
+		beforeIDs := nativeElementIDs(original)
+		before := cloneCanvasState(st)
+		el, ok = s.update(cur, id, body)
+		if !ok {
+			return
+		}
+		if persistErr = s.persistCanvasLocked(cur, s.canvases[cur]); persistErr != nil {
+			s.canvases[cur] = before
+			return
+		}
+		removedIDs := removedElementIDs(beforeIDs, nativeElementIDs(el))
+		message = s.nativeBroadcastMessageLocked("element_updated", []map[string]interface{}{el}, cur, removedIDs)
+	}()
+	if !canvasOK {
+		writeErr(w, http.StatusNotFound, "Canvas "+cur+" not found")
+		return
 	}
-	s.mu.Unlock()
 	if !ok {
 		writeErr(w, http.StatusNotFound, "Element with ID "+id+" not found")
 		return
 	}
-	s.broadcastNative("element_updated", []map[string]interface{}{el}, s.CurrentCanvasID())
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "element": el})
+	if persistErr != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to persist: "+persistErr.Error())
+		return
+	}
+	s.hub.Broadcast(message)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "element": el, "canvasId": cur})
 }
 
 func (s *Store) handleDelete(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	s.mu.Lock()
-	ok := s.remove(id)
-	if ok {
-		cur := s.current
-		if err := s.persistCanvasLocked(cur, s.canvases[cur]); err != nil {
-			s.mu.Unlock()
-			writeErr(w, http.StatusInternalServerError, "failed to persist: "+err.Error())
+	var (
+		cur        string
+		deletedIDs []string
+		canvasOK   bool
+		ok         bool
+		persistErr error
+	)
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		var st *canvasState
+		cur, st, canvasOK = s.mutationCanvasLocked(r)
+		if !canvasOK {
 			return
 		}
+		original, exists := st.elements[id]
+		if !exists {
+			return
+		}
+		deletedIDs = nativeElementIDs(original)
+		before := cloneCanvasState(st)
+		ok = s.remove(cur, id)
+		if !ok {
+			return
+		}
+		if persistErr = s.persistCanvasLocked(cur, s.canvases[cur]); persistErr != nil {
+			s.canvases[cur] = before
+		}
+	}()
+	if !canvasOK {
+		writeErr(w, http.StatusNotFound, "Canvas "+cur+" not found")
+		return
 	}
-	s.mu.Unlock()
 	if !ok {
 		writeErr(w, http.StatusNotFound, "Element with ID "+id+" not found")
 		return
 	}
-	s.hub.Broadcast(map[string]interface{}{"type": "element_deleted", "canvasId": s.CurrentCanvasID(), "elementId": id})
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "Element " + id + " deleted successfully"})
+	if persistErr != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to persist: "+persistErr.Error())
+		return
+	}
+	s.hub.Broadcast(map[string]interface{}{
+		"type":       "element_deleted",
+		"canvasId":   cur,
+		"elementId":  id,
+		"elementIds": deletedIDs,
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": "Element " + id + " deleted successfully", "canvasId": cur})
 }
 
 func (s *Store) handleClear(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	n := s.clearAll()
-	cur := s.current
-	if err := s.persistCanvasLocked(cur, s.canvases[cur]); err != nil {
-		s.mu.Unlock()
-		writeErr(w, http.StatusInternalServerError, "failed to persist: "+err.Error())
+	var (
+		cur        string
+		n          int
+		message    map[string]interface{}
+		canvasOK   bool
+		persistErr error
+	)
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		var st *canvasState
+		cur, st, canvasOK = s.mutationCanvasLocked(r)
+		if !canvasOK {
+			return
+		}
+		before := cloneCanvasState(st)
+		n = s.clearAll(cur)
+		if persistErr = s.persistCanvasLocked(cur, s.canvases[cur]); persistErr != nil {
+			s.canvases[cur] = before
+			return
+		}
+		message = s.nativeBroadcastMessageLocked("canvas_cleared", nil, cur, nil)
+	}()
+	if !canvasOK {
+		writeErr(w, http.StatusNotFound, "Canvas "+cur+" not found")
 		return
 	}
-	s.mu.Unlock()
-	s.broadcastNative("canvas_cleared", nil, cur)
+	if persistErr != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to persist: "+persistErr.Error())
+		return
+	}
+	s.hub.Broadcast(message)
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "message": fmt.Sprintf("Cleared %d elements", n), "count": n})
 }
 
@@ -702,20 +921,42 @@ func (s *Store) handleBatchCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	s.mu.Lock()
-	created := make([]map[string]interface{}, 0, len(body.Elements))
-	for _, e := range body.Elements {
-		created = append(created, s.create(e))
-	}
-	cur := s.current
-	if err := s.persistCanvasLocked(cur, s.canvases[cur]); err != nil {
-		s.mu.Unlock()
-		writeErr(w, http.StatusInternalServerError, "failed to persist: "+err.Error())
+	var (
+		cur        string
+		created    []map[string]interface{}
+		message    map[string]interface{}
+		canvasOK   bool
+		persistErr error
+	)
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		var st *canvasState
+		cur, st, canvasOK = s.mutationCanvasLocked(r)
+		if !canvasOK {
+			return
+		}
+		before := cloneCanvasState(st)
+		created = make([]map[string]interface{}, 0, len(body.Elements))
+		for _, e := range body.Elements {
+			created = append(created, s.create(cur, e))
+		}
+		if persistErr = s.persistCanvasLocked(cur, s.canvases[cur]); persistErr != nil {
+			s.canvases[cur] = before
+			return
+		}
+		message = s.nativeBroadcastMessageLocked("elements_batch_created", created, cur, nil)
+	}()
+	if !canvasOK {
+		writeErr(w, http.StatusNotFound, "Canvas "+cur+" not found")
 		return
 	}
-	s.mu.Unlock()
-	s.broadcastNative("elements_batch_created", created, cur)
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "elements": created, "count": len(created)})
+	if persistErr != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to persist: "+persistErr.Error())
+		return
+	}
+	s.hub.Broadcast(message)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "elements": created, "count": len(created), "canvasId": cur})
 }
 
 func (s *Store) handleGet(w http.ResponseWriter, r *http.Request) {
