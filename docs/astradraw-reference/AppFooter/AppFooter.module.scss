@@ -1,0 +1,66 @@
+// =============================================================================
+// AppFooter - CSS Module
+// =============================================================================
+@use "../../styles/mixins" as *;
+
+// Footer left extra container - adds margin before buttons
+.footerLeftExtra {
+  margin-left: 0.5rem;
+  display: flex;
+  gap: 0.375rem;
+}
+
+// Sidebar toggle buttons (Presentation, Talktrack, Comments) - match ToolIcon style
+.sidebarButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: none;
+  border-radius: var(--border-radius-lg, 8px);
+  cursor: pointer;
+  color: var(--icon-fill-color, #1b1b1f);
+  background-color: #ececf3;
+  transition: background-color 0.15s ease, color 0.15s ease;
+
+  &:hover {
+    background-color: #dcdce5;
+  }
+
+  &:active {
+    background-color: #ccccda;
+  }
+
+  &:focus-visible {
+    box-shadow: 0 0 0 2px var(--focus-highlight-color);
+  }
+}
+
+.toolIconWrapper {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  svg {
+    width: 20px;
+    height: 20px;
+  }
+}
+
+// Dark mode
+@include dark-mode {
+  .sidebarButton {
+    color: var(--icon-fill-color, #e1e1e1);
+    background-color: var(--button-gray-1, rgba(255, 255, 255, 0.04));
+
+    &:hover {
+      background-color: var(--button-gray-2, rgba(255, 255, 255, 0.08));
+    }
+
+    &:active {
+      background-color: var(--button-gray-3, rgba(255, 255, 255, 0.12));
+    }
+  }
+}

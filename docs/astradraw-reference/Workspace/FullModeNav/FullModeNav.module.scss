@@ -1,0 +1,369 @@
+@use "../../../styles/mixins" as *;
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+// Navigation items
+.navList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.navItem {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 12px;
+  background: none;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 0.15s;
+
+  &:hover {
+    background: #f0efff;
+  }
+}
+
+.navItemActive {
+  background: #6a65db;
+  color: white;
+
+  .navIcon {
+    color: white;
+  }
+
+  .navLabel {
+    color: white;
+  }
+}
+
+.navIcon {
+  flex-shrink: 0;
+  color: var(--icon-fill-color, #6b6b6b);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  svg {
+    width: 18px;
+    height: 18px;
+  }
+}
+
+.navLabel {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--text-primary-color, #1b1b1f);
+}
+
+// Collections section
+.collections {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.collectionsHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px;
+  flex-shrink: 0;
+}
+
+.collectionsTitle {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--color-primary, #6965db);
+}
+
+.addCollection {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  background: var(--color-primary, #6965db);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background-color 0.15s;
+
+  &:hover {
+    background: var(--color-primary-darker, #5b57c5);
+  }
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+}
+
+.collectionsList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.collectionsSeparator {
+  height: 1px;
+  background: var(--default-border-color, #e5e5e5);
+  margin: 8px 12px;
+}
+
+.collectionItem {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  background: none;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 0.15s;
+
+  &:hover {
+    background: #f0efff;
+  }
+}
+
+.collectionItemActive {
+  background: #6a65db;
+
+  .collectionIcon {
+    color: white;
+  }
+
+  .collectionName {
+    color: white;
+  }
+
+  .collectionMore {
+    color: white;
+
+    &:hover {
+      background: rgba(255, 255, 255, 0.15);
+    }
+  }
+}
+
+.collectionRow {
+  display: flex;
+  align-items: center;
+  position: relative;
+
+  .collectionItem {
+    flex: 1;
+  }
+}
+
+.collectionRowActive {
+  .collectionItem {
+    background: #6a65db;
+
+    .collectionIcon {
+      color: white;
+    }
+
+    .collectionName {
+      color: white;
+    }
+
+    .collectionMore {
+      color: white;
+
+      &:hover {
+        background: rgba(255, 255, 255, 0.15);
+      }
+    }
+  }
+}
+
+.collectionIcon {
+  flex-shrink: 0;
+  color: var(--icon-fill-color, #6b6b6b);
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+
+  svg {
+    width: 18px;
+    height: 18px;
+  }
+}
+
+.collectionName {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--text-primary-color, #1b1b1f);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.collectionActions {
+  position: relative;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.collectionMore {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--icon-fill-color, #6b6b6b);
+  transition: background-color 0.15s;
+
+  &:hover {
+    background: var(--button-hover-bg, rgba(0, 0, 0, 0.05));
+  }
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+}
+
+.collectionMenu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  min-width: 160px;
+  background: var(--island-bg-color, #fff);
+  border: 1px solid var(--default-border-color, #e5e5e5);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  z-index: 10;
+  overflow: hidden;
+  padding: 4px;
+
+  button {
+    display: block;
+    width: 100%;
+    padding: 8px 12px;
+    background: none;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text-primary-color, #1b1b1f);
+    text-align: left;
+    transition: background-color 0.15s;
+
+    &:hover {
+      background: #f0efff;
+    }
+  }
+}
+
+.menuItemDanger {
+  color: var(--color-danger, #e03131) !important;
+}
+
+// Start drawing button
+.newButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 12px;
+  background: var(--color-primary, #6965db);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s;
+  flex-shrink: 0;
+  margin-top: auto;
+
+  &:hover {
+    background: var(--color-primary-darker, #5b57c5);
+  }
+
+  svg {
+    width: 18px;
+    height: 18px;
+  }
+}
+
+// Dark mode
+@include dark-mode {
+  .navItem {
+    &:hover {
+      background: #f0efff;
+    }
+  }
+
+  .navItemActive {
+    background: #6a65db;
+    color: white;
+
+    .navIcon {
+      color: white;
+    }
+
+    .navLabel {
+      color: white;
+    }
+  }
+
+  .navLabel {
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .collectionItem {
+    &:hover {
+      background: #f0efff;
+    }
+  }
+
+  .collectionName {
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .collectionsSeparator {
+    background: var(--default-border-color, #3d3d3d);
+  }
+
+  .collectionMenu {
+    background: var(--island-bg-color, #2d2d33);
+    border-color: var(--default-border-color, #3d3d3d);
+
+    button {
+      color: var(--text-primary-color, #e1e1e1);
+
+      &:hover {
+        background: #f0efff;
+      }
+    }
+  }
+
+  .collectionMore:hover {
+    background: #f0efff;
+  }
+}

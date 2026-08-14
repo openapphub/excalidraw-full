@@ -1,0 +1,12 @@
+// =============================================================================
+// WorkspaceMainContent - CSS Module
+// =============================================================================
+
+.container {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0; // Important: allows flex child to shrink and enable scrolling
+  height: 100%;
+  overflow: hidden; // Let child views handle their own scrolling
+}

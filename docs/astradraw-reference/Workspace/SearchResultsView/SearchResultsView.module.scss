@@ -1,0 +1,209 @@
+// =============================================================================
+// SearchResultsView - CSS Module
+// =============================================================================
+@use "../../../styles/mixins" as *;
+
+.view {
+  // Define --ui-font locally since component is outside .excalidraw container
+  --ui-font: Assistant, system-ui, BlinkMacSystemFont, -apple-system, Segoe UI,
+    Roboto, Helvetica, Arial, sans-serif;
+  font-family: var(--ui-font);
+
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  padding: 40px;
+}
+
+.spinner {
+  width: 32px;
+  height: 32px;
+  border: 3px solid var(--default-border-color, #e5e5e5);
+  border-top-color: var(--color-primary, #6965db);
+  border-radius: 50%;
+  animation: searchResultsSpin 0.8s linear infinite;
+}
+
+@keyframes searchResultsSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.header {
+  padding: 32px 40px 24px;
+  flex-shrink: 0;
+}
+
+.titleRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-primary, #6965db);
+
+  svg {
+    width: 28px;
+    height: 28px;
+  }
+}
+
+.title {
+  flex: 1;
+  margin: 0;
+  font-size: 24px;
+  font-weight: 600;
+  color: var(--text-primary-color, #1b1b1f);
+}
+
+.clear {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: transparent;
+  border: 1px solid var(--default-border-color, #e5e5e5);
+  border-radius: 8px;
+  color: var(--text-secondary-color, #6b6b6b);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s;
+
+  &:hover {
+    background: var(--button-hover-bg, rgba(0, 0, 0, 0.05));
+    border-color: var(--color-primary, #6965db);
+    color: var(--color-primary, #6965db);
+  }
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+}
+
+.count {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text-secondary-color, #6b6b6b);
+}
+
+.separator {
+  height: 1px;
+  margin: 0 40px;
+  background: var(--default-border-color, #e5e5e5);
+  flex-shrink: 0;
+}
+
+.content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px 40px 40px;
+}
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 60px 20px;
+  text-align: center;
+}
+
+.emptyIcon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  margin-bottom: 20px;
+  background: var(--default-bg-color, #f8f8f8);
+  border-radius: 50%;
+  color: var(--text-secondary-color, #9b9b9b);
+
+  svg {
+    width: 32px;
+    height: 32px;
+  }
+}
+
+.emptyTitle {
+  margin: 0 0 8px;
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary-color, #1b1b1f);
+}
+
+.emptyHint {
+  margin: 0 0 24px;
+  font-size: 14px;
+  color: var(--text-secondary-color, #6b6b6b);
+}
+
+.emptyCta {
+  padding: 10px 20px;
+  background: var(--color-primary, #6965db);
+  border: none;
+  border-radius: 8px;
+  color: white;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s;
+
+  &:hover {
+    background: var(--color-primary-darker, #5b57c5);
+  }
+}
+
+// Dark mode
+@include dark-mode {
+  .title {
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .clear {
+    border-color: var(--default-border-color, #3d3d3d);
+    color: var(--text-secondary-color, #9b9b9b);
+
+    &:hover {
+      background: var(--button-hover-bg, rgba(255, 255, 255, 0.05));
+      border-color: var(--color-primary-light, #a5a1ff);
+      color: var(--color-primary-light, #a5a1ff);
+    }
+  }
+
+  .count {
+    color: var(--text-secondary-color, #9b9b9b);
+  }
+
+  .separator {
+    background: var(--default-border-color, #3d3d3d);
+  }
+
+  .emptyIcon {
+    background: var(--default-bg-color, #2d2d33);
+    color: var(--text-secondary-color, #9b9b9b);
+  }
+
+  .emptyTitle {
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .emptyHint {
+    color: var(--text-secondary-color, #9b9b9b);
+  }
+}

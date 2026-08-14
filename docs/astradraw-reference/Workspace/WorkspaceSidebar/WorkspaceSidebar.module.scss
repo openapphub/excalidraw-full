@@ -1,0 +1,845 @@
+// =============================================================================
+// WorkspaceSidebar - CSS Module
+// =============================================================================
+// The sidebar slides in/out from the left side of the screen.
+// When closed, it's hidden off-screen with negative margin.
+//
+// BORDER VISIBILITY FIX:
+// The border-right is transparent by default and only becomes visible
+// when the sidebar is open (--open class). This prevents a thin line
+// from appearing on the left edge of the screen when the sidebar is closed,
+// which was especially noticeable against the dark galaxy background.
+// =============================================================================
+@use "../../../styles/mixins" as *;
+
+.sidebar {
+  // Define --ui-font locally since sidebar is outside .excalidraw container
+  --ui-font: Assistant, system-ui, BlinkMacSystemFont, -apple-system, Segoe UI,
+    Roboto, Helvetica, Arial, sans-serif;
+
+  width: 300px;
+  min-width: 300px;
+  height: 100%;
+  background: var(--island-bg-color, #fff);
+  // Border is transparent when closed to prevent visible line on welcome screen
+  border-right: 1px solid transparent;
+  display: flex;
+  flex-direction: column;
+  z-index: 100;
+  flex-shrink: 0;
+  font-family: var(--ui-font);
+
+  // When closed: completely hidden (no white line visible)
+  // Using visibility + opacity allows transition on open, but hides completely when closed
+  visibility: hidden;
+  opacity: 0;
+  margin-left: -300px;
+  transition: margin-left 0.2s ease-out, border-color 0.2s ease-out,
+    visibility 0s 0.2s, opacity 0.2s ease-out;
+
+  // Note: Presentation mode hiding is done in index.scss using attribute selector
+  // because CSS Modules mangles class names
+}
+
+.open {
+  margin-left: 0;
+  visibility: visible;
+  opacity: 1;
+  // Border becomes visible when sidebar is open
+  border-right-color: var(--default-border-color, #e5e5e5);
+  // Reset transition delay for visibility when opening
+  transition: margin-left 0.2s ease-out, border-color 0.2s ease-out,
+    visibility 0s 0s, opacity 0.2s ease-out;
+}
+
+// ============================================
+// Workspace Header (compact row at top)
+// ============================================
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px;
+  flex-shrink: 0;
+  min-height: 56px;
+}
+
+.workspace {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.workspaceTrigger {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+
+  &:hover {
+    .workspaceName {
+      color: var(--text-primary-color, #1b1b1f);
+    }
+  }
+}
+
+.workspaceAvatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-primary, #6965db);
+  color: white;
+  font-size: 16px;
+  font-weight: 600;
+  overflow: hidden;
+
+  img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+}
+
+.workspaceAvatarSmall {
+  width: 24px;
+  height: 24px;
+  font-size: 11px;
+}
+
+.workspaceName {
+  flex: 1;
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text-secondary-color, #6b6b6b);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color 0.15s;
+}
+
+.chevron {
+  flex-shrink: 0;
+  color: var(--icon-fill-color, #6b6b6b);
+  transition: transform 0.15s;
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+}
+
+.chevronOpen {
+  transform: rotate(180deg);
+}
+
+.workspaceMenu {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  right: 0;
+  background: var(--island-bg-color, #fff);
+  border: 1px solid var(--default-border-color, #e5e5e5);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+  z-index: 10;
+  overflow: hidden;
+  padding: 4px;
+}
+
+.menuSectionTitle {
+  padding: 8px 10px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-secondary-color, #9b9b9b);
+}
+
+.menuItem {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-primary-color, #1b1b1f);
+  transition: background-color 0.15s;
+
+  &:hover {
+    background: #f0efff;
+  }
+}
+
+.menuItemActive {
+  background: #6a65db;
+  color: white;
+}
+
+.menuItemDanger {
+  color: var(--color-danger, #e03131);
+}
+
+.menuItemCreate {
+  color: var(--color-primary, #6965db);
+  font-weight: 500;
+}
+
+.check {
+  margin-left: auto;
+  color: var(--color-primary, #6965db);
+  font-weight: 600;
+}
+
+.title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary-color, #1b1b1f);
+}
+
+.close {
+  background: none;
+  border: none;
+  padding: 8px;
+  cursor: pointer;
+  color: var(--icon-fill-color, #5f5f5f);
+  border-radius: 6px;
+  transition: background-color 0.15s, color 0.15s;
+
+  &:hover {
+    background: var(--button-hover-bg, rgba(0, 0, 0, 0.05));
+    color: var(--text-primary-color, #1b1b1f);
+  }
+
+  svg {
+    width: 18px;
+    height: 18px;
+  }
+}
+
+// ============================================
+// Divider
+// ============================================
+.divider {
+  height: 1px;
+  background: var(--default-border-color, #e5e5e5);
+  margin: 0 16px;
+  flex-shrink: 0;
+}
+
+// ============================================
+// Content area
+// ============================================
+.content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+// ============================================
+// Search bar
+// ============================================
+.search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--default-bg-color, #f5f5f5);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  transition: border-color 0.15s, background-color 0.15s;
+  flex-shrink: 0;
+
+  &:focus-within {
+    background: var(--island-bg-color, #fff);
+    border-color: var(--color-primary, #6965db);
+  }
+}
+
+.searchIcon {
+  flex-shrink: 0;
+  color: var(--icon-fill-color, #6b6b6b);
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+}
+
+.searchInput {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  font-size: 13px;
+  color: var(--text-primary-color, #1b1b1f);
+
+  &::placeholder {
+    color: var(--text-secondary-color, #9b9b9b);
+  }
+}
+
+.searchHint {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--text-secondary-color, #9b9b9b);
+  background: var(--island-bg-color, #fff);
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--default-border-color, #e5e5e5);
+}
+
+// ============================================
+// User footer (fixed at bottom)
+// ============================================
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  flex-shrink: 0;
+}
+
+.userButton {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  border-radius: 8px;
+  transition: background-color 0.15s;
+  flex: 1;
+  min-width: 0;
+
+  &:hover {
+    background: var(--button-hover-bg, rgba(0, 0, 0, 0.05));
+  }
+}
+
+.userAvatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  object-fit: cover;
+}
+
+.userAvatarInitials {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--color-primary, #6965db);
+  color: white;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.userName {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary-color, #1b1b1f);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.notificationButton {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  background: none;
+  border: 1px solid var(--default-border-color, #e5e5e5);
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--icon-fill-color, #6b6b6b);
+  transition: background-color 0.15s, border-color 0.15s;
+  flex-shrink: 0;
+
+  &:hover {
+    background: var(--button-hover-bg, rgba(0, 0, 0, 0.05));
+    border-color: var(--text-secondary-color, #9b9b9b);
+  }
+
+  svg {
+    width: 18px;
+    height: 18px;
+  }
+}
+
+// ============================================
+// Loading, empty, error states
+// ============================================
+.loading {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 40px;
+}
+
+.spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid var(--default-border-color, #e5e5e5);
+  border-top-color: var(--color-primary, #6965db);
+  border-radius: 50%;
+  animation: sidebarSpin 1s linear infinite;
+}
+
+@keyframes sidebarSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.empty,
+.login {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--text-primary-color, #1b1b1f);
+
+  p {
+    margin: 0 0 8px;
+    font-size: 14px;
+    font-weight: 500;
+  }
+}
+
+.emptyHint {
+  font-size: 12px;
+  color: var(--text-secondary-color, #6b6b6b);
+}
+
+.loginButton {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+  padding: 12px 24px;
+  background: var(--color-primary, #6965db);
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s;
+
+  &:hover {
+    background: var(--color-primary-darker, #5b57c5);
+  }
+
+  svg {
+    width: 18px;
+    height: 18px;
+  }
+}
+
+.error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 20px;
+  text-align: center;
+  color: var(--color-danger, #e03131);
+
+  button {
+    padding: 8px 16px;
+    background: var(--color-primary, #6965db);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+
+    &:hover {
+      background: var(--color-primary-darker, #5b57c5);
+    }
+  }
+}
+
+// ============================================
+// Dialog (Create Collection)
+// ============================================
+.dialogOverlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.dialog {
+  background: var(--island-bg-color, #fff);
+  border-radius: 12px;
+  padding: 24px;
+  width: 100%;
+  max-width: 400px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+
+  h3 {
+    margin: 0 0 20px;
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary-color, #1b1b1f);
+  }
+}
+
+.dialogWide {
+  width: 400px;
+  max-width: 90vw;
+}
+
+.dialogContent {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.formRow {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.formGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+
+  label {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-secondary-color, #6b6b6b);
+  }
+
+  input {
+    padding: 10px 12px;
+    background: var(--default-bg-color, #f5f5f5);
+    border: 1px solid transparent;
+    border-radius: 8px;
+    font-size: 14px;
+    color: var(--text-primary-color, #1b1b1f);
+    transition: border-color 0.15s, background-color 0.15s;
+    height: 56px;
+    box-sizing: border-box;
+
+    &:focus {
+      outline: none;
+      background: var(--island-bg-color, #fff);
+      border-color: var(--color-primary, #6965db);
+    }
+  }
+}
+
+.formGroupIcon {
+  flex-shrink: 0;
+}
+
+.formGroupName {
+  flex: 1;
+}
+
+.dialogActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 20px;
+}
+
+.dialogCancel {
+  padding: 10px 16px;
+  background: none;
+  border: 1px solid var(--default-border-color, #e5e5e5);
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary-color, #1b1b1f);
+  cursor: pointer;
+  transition: background-color 0.15s;
+
+  &:hover {
+    background: var(--button-hover-bg, rgba(0, 0, 0, 0.05));
+  }
+}
+
+.dialogConfirm {
+  padding: 10px 16px;
+  background: var(--color-primary, #6965db);
+  border: none;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  color: white;
+  cursor: pointer;
+  transition: background-color 0.15s;
+
+  &:hover:not(:disabled) {
+    background: var(--color-primary-darker, #5b57c5);
+  }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+}
+
+// ============================================
+// Menu divider and create button
+// ============================================
+.menuDivider {
+  height: 1px;
+  background: var(--default-border-color, #e5e5e5);
+  margin: 4px 0;
+}
+
+.menuItemIcon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  background: var(--color-primary, #6965db);
+  color: white;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+// ============================================
+// Form hint and error
+// ============================================
+.formHint {
+  font-size: 12px;
+  color: var(--text-secondary-color, #9b9b9b);
+  margin-top: 4px;
+}
+
+.formError {
+  padding: 10px 12px;
+  background: var(--color-danger-light, rgba(224, 49, 49, 0.1));
+  border-radius: 8px;
+  color: var(--color-danger, #e03131);
+  font-size: 13px;
+}
+
+// ============================================
+// Type selector (toggle buttons)
+// ============================================
+.typeSelector {
+  display: flex;
+  gap: 8px;
+}
+
+.typeOption {
+  flex: 1;
+  padding: 10px 16px;
+  background: var(--default-bg-color, #f5f5f5);
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-secondary-color, #6b6b6b);
+  cursor: pointer;
+  transition: all 0.15s;
+
+  &:hover {
+    background: var(--button-hover-bg, rgba(0, 0, 0, 0.08));
+  }
+}
+
+.typeOptionActive {
+  background: var(--color-primary-light, rgba(105, 101, 219, 0.15));
+  border-color: var(--color-primary, #6965db);
+  color: var(--color-primary, #6965db);
+}
+
+// ============================================
+// Dark mode
+// ============================================
+@include dark-mode {
+  .sidebar {
+    background: var(--island-bg-color, #232329);
+  }
+
+  .open {
+    border-right-color: var(--default-border-color, #3d3d3d);
+  }
+
+  .divider {
+    background: var(--default-border-color, #3d3d3d);
+  }
+
+  .title {
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .close:hover {
+    background: var(--button-hover-bg, rgba(255, 255, 255, 0.1));
+  }
+
+  .workspaceName {
+    color: var(--text-secondary-color, #9b9b9b);
+  }
+
+  .workspaceTrigger:hover {
+    .workspaceName {
+      color: var(--text-primary-color, #e1e1e1);
+    }
+  }
+
+  .workspaceMenu {
+    background: var(--island-bg-color, #2d2d33);
+    border-color: var(--default-border-color, #3d3d3d);
+  }
+
+  .menuItem {
+    color: var(--text-primary-color, #e1e1e1);
+
+    &:hover {
+      background: var(--button-hover-bg, rgba(255, 255, 255, 0.1));
+    }
+  }
+
+  .search {
+    background: var(--default-bg-color, #2d2d33);
+
+    &:focus-within {
+      background: var(--island-bg-color, #232329);
+      border-color: var(--color-primary-light, #a5a1ff);
+    }
+  }
+
+  .searchInput {
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .searchHint {
+    background: var(--island-bg-color, #232329);
+    border-color: var(--default-border-color, #3d3d3d);
+  }
+
+  .spinner {
+    border-color: var(--default-border-color, #3d3d3d);
+    border-top-color: var(--color-primary, #a5a1ff);
+  }
+
+  .empty,
+  .login {
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .emptyHint {
+    color: var(--text-secondary-color, #9b9b9b);
+  }
+
+  .userName {
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .userButton:hover {
+    background: var(--button-hover-bg, rgba(255, 255, 255, 0.1));
+  }
+
+  .notificationButton {
+    border-color: var(--default-border-color, #3d3d3d);
+
+    &:hover {
+      background: var(--button-hover-bg, rgba(255, 255, 255, 0.1));
+      border-color: var(--text-secondary-color, #6b6b6b);
+    }
+  }
+
+  .dialog {
+    background: var(--island-bg-color, #2d2d33);
+
+    h3 {
+      color: var(--text-primary-color, #e1e1e1);
+    }
+  }
+
+  .formGroup {
+    input {
+      background: var(--default-bg-color, #232329);
+      color: var(--text-primary-color, #e1e1e1);
+
+      &:focus {
+        background: var(--island-bg-color, #2d2d33);
+      }
+    }
+  }
+
+  .iconOption {
+    background: var(--default-bg-color, #232329);
+
+    &:hover {
+      background: var(--button-hover-bg, rgba(255, 255, 255, 0.1));
+    }
+  }
+
+  .iconOptionSelected {
+    background: var(--color-primary-light, rgba(165, 161, 255, 0.15));
+  }
+
+  .dialogCancel {
+    color: var(--text-primary-color, #e1e1e1);
+    border-color: var(--default-border-color, #3d3d3d);
+
+    &:hover {
+      background: var(--button-hover-bg, rgba(255, 255, 255, 0.1));
+    }
+  }
+
+  .menuDivider {
+    background: var(--default-border-color, #3d3d3d);
+  }
+
+  .typeOption {
+    background: var(--default-bg-color, #232329);
+    color: var(--text-secondary-color, #9b9b9b);
+
+    &:hover {
+      background: var(--button-hover-bg, rgba(255, 255, 255, 0.1));
+    }
+  }
+
+  .typeOptionActive {
+    background: var(--color-primary-light, rgba(165, 161, 255, 0.15));
+    color: var(--color-primary-light, #a5a1ff);
+  }
+
+  .formError {
+    background: var(--color-danger-light, rgba(224, 49, 49, 0.15));
+  }
+}

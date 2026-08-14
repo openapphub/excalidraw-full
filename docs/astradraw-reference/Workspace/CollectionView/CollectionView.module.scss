@@ -1,0 +1,315 @@
+// =============================================================================
+// CollectionView - CSS Module
+// =============================================================================
+@use "../../../styles/mixins" as *;
+
+.view {
+  // Define --ui-font locally since collection view is outside .excalidraw container
+  --ui-font: Assistant, system-ui, BlinkMacSystemFont, -apple-system, Segoe UI,
+    Roboto, Helvetica, Arial, sans-serif;
+  font-family: var(--ui-font);
+
+  flex: 1;
+  padding: 32px 48px;
+  overflow-y: auto;
+  background: var(--default-bg-color, #fafafa);
+}
+
+// Loading state
+.loading {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 300px;
+}
+
+.spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid var(--default-border-color, #e5e5e5);
+  border-top-color: var(--color-primary, #6965db);
+  border-radius: 50%;
+  animation: collectionSpin 1s linear infinite;
+}
+
+@keyframes collectionSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+// Header
+.header {
+  margin-bottom: 0;
+}
+
+.titleRow {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--icon-fill-color, #6b6b6b);
+  font-size: 28px;
+
+  svg {
+    width: 28px;
+    height: 28px;
+  }
+}
+
+.iconDefault {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0;
+
+  svg {
+    width: 24px;
+    height: 24px;
+    color: var(--text-secondary-color, #6b6b6b);
+  }
+}
+
+.title {
+  flex: 1;
+  margin: 0;
+  font-size: 25px;
+  font-weight: 500;
+  color: var(--text-primary-color, #1b1b1f);
+}
+
+.description {
+  margin: 8px 0 0;
+  font-size: 14px;
+  color: var(--text-secondary-color, #6b6b6b);
+}
+
+.separator {
+  height: 1px;
+  background: var(--default-border-color, #e5e5e5);
+  margin: 24px 0;
+}
+
+// Sort dropdown
+.sort {
+  position: relative;
+}
+
+.sortTrigger {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: var(--island-bg-color, #fff);
+  border: 1px solid var(--default-border-color, #e5e5e5);
+  border-radius: 8px;
+  font-size: 14px;
+  color: var(--text-primary-color, #1b1b1f);
+  cursor: pointer;
+  transition: border-color 0.15s;
+
+  &:hover {
+    border-color: var(--color-primary, #6965db);
+  }
+
+  svg {
+    width: 16px;
+    height: 16px;
+    color: var(--icon-fill-color, #6b6b6b);
+  }
+}
+
+.sortMenu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 4px;
+  min-width: 160px;
+  background: var(--island-bg-color, #fff);
+  border: 1px solid var(--default-border-color, #e5e5e5);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+  z-index: 10;
+  overflow: hidden;
+  padding: 4px;
+
+  button {
+    display: block;
+    width: 100%;
+    padding: 10px 12px;
+    background: none;
+    border: none;
+    border-radius: 6px;
+    font-size: 14px;
+    color: var(--text-primary-color, #1b1b1f);
+    text-align: left;
+    cursor: pointer;
+    transition: background-color 0.15s;
+
+    &:hover {
+      background: var(--button-hover-bg, rgba(0, 0, 0, 0.05));
+    }
+  }
+}
+
+.sortMenuActive {
+  background: var(--color-primary-light, rgba(105, 101, 219, 0.1));
+  color: var(--color-primary, #6965db);
+}
+
+// Action buttons
+.actions {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 32px;
+}
+
+.actionButton {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 20px 24px;
+  background: var(--island-bg-color, #fff);
+  border: 2px dashed var(--default-border-color, #d0d0d0);
+  border-radius: 12px;
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text-primary-color, #1b1b1f);
+  cursor: pointer;
+  transition: border-color 0.15s, background-color 0.15s;
+  min-width: 200px;
+
+  &:hover {
+    border-color: var(--color-primary, #6965db);
+    background: var(--color-primary-light, rgba(105, 101, 219, 0.05));
+  }
+
+  svg {
+    width: 20px;
+    height: 20px;
+    color: var(--color-primary, #6965db);
+
+    &:last-child {
+      margin-left: auto;
+      width: 16px;
+      height: 16px;
+      color: var(--icon-fill-color, #9b9b9b);
+    }
+  }
+}
+
+// Content area
+.content {
+  min-height: 200px;
+}
+
+// Empty state
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 80px 40px;
+  text-align: center;
+}
+
+.emptyIllustration {
+  width: 200px;
+  height: 120px;
+  margin-bottom: 24px;
+  color: var(--icon-fill-color, #9b9b9b);
+  opacity: 0.5;
+}
+
+.emptyTitle {
+  margin: 0 0 16px;
+  font-size: 18px;
+  font-style: italic;
+  color: var(--text-secondary-color, #6b6b6b);
+}
+
+.emptyCta {
+  padding: 12px 32px;
+  background: none;
+  border: none;
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--color-primary, #6965db);
+  cursor: pointer;
+  text-decoration: underline;
+  transition: color 0.15s;
+
+  &:hover {
+    color: var(--color-primary-darker, #5b57c5);
+  }
+}
+
+.emptyHint {
+  margin: 16px 0 0;
+  font-size: 13px;
+  color: var(--text-secondary-color, #9b9b9b);
+}
+
+// Dark mode
+@include dark-mode {
+  .view {
+    background: var(--default-bg-color, #1e1e24);
+  }
+
+  .spinner {
+    border-color: var(--default-border-color, #3d3d3d);
+    border-top-color: var(--color-primary, #a5a1ff);
+  }
+
+  .title {
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .iconDefault {
+    svg {
+      color: var(--text-secondary-color, #9b9b9b);
+    }
+  }
+
+  .separator {
+    background: var(--default-border-color, #3d3d3d);
+  }
+
+  .sortTrigger {
+    background: var(--island-bg-color, #232329);
+    border-color: var(--default-border-color, #3d3d3d);
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .sortMenu {
+    background: var(--island-bg-color, #2d2d33);
+    border-color: var(--default-border-color, #3d3d3d);
+
+    button {
+      color: var(--text-primary-color, #e1e1e1);
+
+      &:hover {
+        background: var(--button-hover-bg, rgba(255, 255, 255, 0.1));
+      }
+    }
+  }
+
+  .sortMenuActive {
+    background: var(--color-primary-light, rgba(165, 161, 255, 0.15));
+  }
+
+  .actionButton {
+    background: var(--island-bg-color, #232329);
+    border-color: var(--default-border-color, #3d3d3d);
+    color: var(--text-primary-color, #e1e1e1);
+
+    &:hover {
+      background: var(--color-primary-light, rgba(165, 161, 255, 0.1));
+    }
+  }
+}

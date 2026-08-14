@@ -1,0 +1,256 @@
+// =============================================================================
+// BoardModeNav - CSS Module
+// =============================================================================
+@use "../../../styles/mixins" as *;
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 8px;
+}
+
+// Dashboard link
+.dashboard {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 12px;
+  background: none;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+  transition: background-color 0.15s;
+
+  &:hover {
+    background: var(--button-hover-bg, rgba(0, 0, 0, 0.05));
+  }
+}
+
+.icon {
+  flex-shrink: 0;
+  color: var(--icon-fill-color, #6b6b6b);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  svg {
+    width: 18px;
+    height: 18px;
+  }
+}
+
+.label {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--text-primary-color, #1b1b1f);
+}
+
+// Collection header
+.collectionHeader {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--color-primary-light, rgba(105, 101, 219, 0.1));
+  border-radius: 8px;
+  margin-top: 4px;
+}
+
+.back {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--icon-fill-color, #6b6b6b);
+  transition: background-color 0.15s, color 0.15s;
+
+  &:hover {
+    background: var(--button-hover-bg, rgba(0, 0, 0, 0.1));
+    color: var(--text-primary-color, #1b1b1f);
+  }
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+}
+
+.collectionIcon {
+  flex-shrink: 0;
+  color: var(--color-primary, #6965db);
+  font-size: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+
+  svg {
+    width: 18px;
+    height: 18px;
+  }
+}
+
+.collectionName {
+  flex: 1;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary-color, #1b1b1f);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.collectionActions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.sort,
+.add {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--icon-fill-color, #6b6b6b);
+  transition: background-color 0.15s, color 0.15s;
+
+  &:hover {
+    background: var(--button-hover-bg, rgba(0, 0, 0, 0.1));
+    color: var(--text-primary-color, #1b1b1f);
+  }
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+}
+
+.add {
+  background: var(--color-primary, #6965db);
+  color: white;
+
+  &:hover {
+    background: var(--color-primary-darker, #5b57c5);
+    color: white;
+  }
+}
+
+// Scene list
+.scenes {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  margin-top: 8px;
+}
+
+.sceneList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+// Loading state
+.loading {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 40px;
+}
+
+.spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid var(--default-border-color, #e5e5e5);
+  border-top-color: var(--color-primary, #6965db);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+// Empty state
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--text-primary-color, #1b1b1f);
+
+  p {
+    margin: 0 0 8px;
+    font-size: 14px;
+    font-weight: 500;
+  }
+}
+
+.emptyHint {
+  font-size: 12px;
+  color: var(--text-secondary-color, #6b6b6b);
+}
+
+// Dark mode
+@include dark-mode {
+  .dashboard:hover {
+    background: var(--button-hover-bg, rgba(255, 255, 255, 0.1));
+  }
+
+  .label {
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .collectionHeader {
+    background: var(--color-primary-light, rgba(165, 161, 255, 0.15));
+  }
+
+  .back:hover {
+    background: var(--button-hover-bg, rgba(255, 255, 255, 0.1));
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .collectionName {
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .sort:hover {
+    background: var(--button-hover-bg, rgba(255, 255, 255, 0.1));
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .spinner {
+    border-color: var(--default-border-color, #3d3d3d);
+    border-top-color: var(--color-primary, #a5a1ff);
+  }
+
+  .empty {
+    color: var(--text-primary-color, #e1e1e1);
+  }
+
+  .emptyHint {
+    color: var(--text-secondary-color, #9b9b9b);
+  }
+}
