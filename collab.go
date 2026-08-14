@@ -97,6 +97,35 @@ func (r *collabSessionRegistry) sameRoom(first, second socketio.SocketId) bool {
 	return firstOK && secondOK && firstSession.room == secondSession.room
 }
 
+// commentEventName 是 AstraDraw 客户端广播评论变更用的事件名
+// （excalidraw-app/app_constants.ts 的 WS_EVENTS.COMMENT_EVENT）。
+const commentEventName = "comment:event"
+
+// registerCommentRelay 在协作房间内转发评论事件，让同房间的其他人无需刷新
+// 即可看到新线程/回复。非协作场景（无房间）下客户端靠 react-query 重新拉取。
+//
+// 载荷不落库，只做转发；权限由 REST 层把关（这里仅限制必须在自己房间内）。
+func registerCommentRelay(
+	socket *socketio.Socket,
+	sessions *collabSessionRegistry,
+	me socketio.SocketId,
+) {
+	socket.On(commentEventName, func(datas ...any) {
+		if len(datas) < 2 {
+			return
+		}
+		roomID, ok := datas[0].(string)
+		if !ok {
+			return
+		}
+		joinedRoom, joined := sessions.roomFor(me)
+		if !joined || string(joinedRoom) != roomID {
+			return
+		}
+		socket.Broadcast().To(socketio.Room(roomID)).Emit(commentEventName, datas[1])
+	})
+}
+
 func parseJoinRoomData(datas []any) (socketio.Room, string, bool) {
 	if len(datas) == 0 {
 		return "", "", false

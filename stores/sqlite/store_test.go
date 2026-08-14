@@ -292,3 +292,30 @@ func TestMigrateLegacyDBAddsWorkspaceColumn(t *testing.T) {
 		t.Fatal("二次打开后 workspace_id 列丢失")
 	}
 }
+
+func TestSaveRejectsIndexedDBCanvasID(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	const userID = "user-idb"
+	const uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+
+	err := store.Save(ctx, &core.Canvas{
+		ID:     uuid,
+		UserID: userID,
+		Name:   "from-indexeddb",
+		Data:   []byte(`{"elements":[{"id":"x"}]}`),
+	})
+	if err == nil {
+		t.Fatal("Save IndexedDB UUID 应被拒绝")
+	}
+
+	list, err := store.List(ctx, userID)
+	if err != nil {
+		t.Fatalf("List() 错误 = %v", err)
+	}
+	for _, c := range list {
+		if c.ID == uuid {
+			t.Fatal("SQLite 不应留下 IndexedDB UUID 画布")
+		}
+	}
+}

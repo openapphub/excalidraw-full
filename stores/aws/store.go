@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"excalidraw-complete/core"
+	"excalidraw-complete/stores/shellstub"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -20,7 +21,10 @@ import (
 	"github.com/oklog/ulid/v2"
 )
 
+// s3Store 落地 Document/Canvas/Workspace 存储；Workspace Shell 暂未支持，
+// 嵌入 shellstub.Unsupported 满足统一接口。
 type s3Store struct {
+	shellstub.Unsupported
 	s3Client *s3.Client
 	bucket   string
 }

@@ -385,6 +385,7 @@ func createJWT(user *core.User) (string, error) {
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
 		Login:     user.Login,
+		Email:     user.Email,
 		AvatarURL: user.AvatarURL,
 		Name:      user.Name,
 	}

@@ -2,6 +2,7 @@ package kv
 
 import (
 	"encoding/json"
+	"errors"
 	"excalidraw-complete/core"
 	"excalidraw-complete/handlers/auth"
 	"excalidraw-complete/middleware"
@@ -74,8 +75,12 @@ func HandleGetCanvas(store stores.Store) http.HandlerFunc {
 			return
 		}
 
-		// The canvas data is returned as raw bytes.
+		// 空 data 必须是合法 JSON，否则前端 response.json() 会抛错变成 Could not load the canvas.
 		w.Header().Set("Content-Type", "application/json")
+		if len(canvas.Data) == 0 {
+			w.Write([]byte(`{"elements":[],"appState":{},"files":{}}`))
+			return
+		}
 		w.Write(canvas.Data)
 	}
 }
@@ -112,9 +117,11 @@ func HandleSaveCanvas(store stores.Store) http.HandlerFunc {
 		// might parse a name from the body or have a separate field.
 		var canvasData struct {
 			AppState struct {
-				Name string `json:"name"`
+				Name        string `json:"name"`
+				WorkspaceID string `json:"workspaceId"`
 			} `json:"appState"`
-			Thumbnail string `json:"thumbnail"`
+			Thumbnail   string `json:"thumbnail"`
+			WorkspaceID string `json:"workspaceId"`
 		}
 		// We make a copy of the body because json.Unmarshal will consume the reader.
 		bodyCopy := make([]byte, len(body))
@@ -122,6 +129,7 @@ func HandleSaveCanvas(store stores.Store) http.HandlerFunc {
 
 		canvasName := key // Default to key
 		var canvasThumbnail string
+		canvasWorkspaceID := ""
 		if err := json.Unmarshal(bodyCopy, &canvasData); err == nil {
 			// AI canvases (id prefix "ai-") keep a stable name — ignore the
 			// frontend's auto-generated "无标题-<timestamp>" names, otherwise
@@ -130,14 +138,33 @@ func HandleSaveCanvas(store stores.Store) http.HandlerFunc {
 				canvasName = canvasData.AppState.Name
 			}
 			canvasThumbnail = canvasData.Thumbnail
+			// workspaceId 优先取顶层字段，其次 appState.workspaceId（前端新画布携带）。
+			// 空字符串表示 body 未携带 → 保留 DB 现有分组（避免保存覆盖已移动的分组）。
+			if canvasData.WorkspaceID != "" {
+				canvasWorkspaceID = canvasData.WorkspaceID
+			} else if canvasData.AppState.WorkspaceID != "" {
+				canvasWorkspaceID = canvasData.AppState.WorkspaceID
+			}
+		}
+
+		// body 未携带 workspaceId 时，保留画布现有的分组归属。
+		if canvasWorkspaceID == "" {
+			existing, err := store.Get(r.Context(), claims.Subject, key)
+			if err == nil && existing != nil && existing.WorkspaceID != "" {
+				canvasWorkspaceID = existing.WorkspaceID
+			}
+		}
+		if canvasWorkspaceID == "" {
+			canvasWorkspaceID = "default"
 		}
 
 		canvas := &core.Canvas{
-			ID:        key,
-			UserID:    claims.Subject,
-			Name:      canvasName,
-			Thumbnail: canvasThumbnail,
-			Data:      body,
+			ID:          key,
+			UserID:      claims.Subject,
+			Name:        canvasName,
+			Thumbnail:   canvasThumbnail,
+			Data:        body,
+			WorkspaceID: canvasWorkspaceID,
 		}
 
 		if err := store.Save(r.Context(), canvas); err != nil {
@@ -146,6 +173,21 @@ func HandleSaveCanvas(store stores.Store) http.HandlerFunc {
 				"userID": claims.Subject,
 				"key":    key,
 			}).Error("Failed to save canvas")
+			var lockErr *core.SceneLockError
+			if errors.As(err, &lockErr) {
+				render.Status(r, http.StatusConflict)
+				render.JSON(w, r, map[string]any{
+					"error":   lockErr.Error(),
+					"message": lockErr.Error(),
+					"editor":  lockErr.Editor,
+				})
+				return
+			}
+			if errors.Is(err, core.ErrForbidden) {
+				render.Status(r, http.StatusForbidden)
+				render.JSON(w, r, map[string]string{"error": "Access denied"})
+				return
+			}
 			render.Status(r, http.StatusInternalServerError)
 			render.JSON(w, r, map[string]string{"error": "Failed to save canvas"})
 			return

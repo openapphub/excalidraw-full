@@ -16,6 +16,9 @@ type Store interface {
 	core.DocumentStore
 	core.CanvasStore
 	core.WorkspaceStore
+	core.ShellStore
+	core.CommentStore
+	core.LocalAuthStore
 }
 
 func GetStore() Store {

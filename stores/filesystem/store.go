@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"excalidraw-complete/core"
+	"excalidraw-complete/stores/shellstub"
 	"fmt"
 	"log"
 	"os"
@@ -16,7 +17,10 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// fsStore 落地 Document/Canvas/Workspace 存储；Workspace Shell 暂未支持，
+// 嵌入 shellstub.Unsupported 满足统一接口。
 type fsStore struct {
+	shellstub.Unsupported
 	basePath string
 }
 

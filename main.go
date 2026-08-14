@@ -4,11 +4,13 @@ import (
 	"embed"
 	_ "embed"
 	"encoding/json"
+	commentsapi "excalidraw-complete/handlers/api/comments"
 	"excalidraw-complete/handlers/api/documents"
 	"excalidraw-complete/handlers/api/firebase"
 	"excalidraw-complete/handlers/api/kv"
 	"excalidraw-complete/handlers/api/mcpcanvas"
 	"excalidraw-complete/handlers/api/openai"
+	workspaceapi "excalidraw-complete/handlers/api/workspace"
 	"excalidraw-complete/handlers/auth"
 	authMiddleware "excalidraw-complete/middleware"
 	"excalidraw-complete/stores"
@@ -162,8 +164,19 @@ func setupRouter(store stores.Store) *chi.Mux {
 		r.Post("/documents:commit", firebase.HandleBatchCommit())
 		r.Post("/documents:batchGet", firebase.HandleBatchGet())
 	})
+	// firestore.googleapis.com 被改写到本机后，SDK 会打这条 Listen
+	r.Handle("/google.firestore.v1.Firestore/Listen/channel", firebase.HandleListenChannel())
 
 	r.Route("/api/v2", func(r chi.Router) {
+		r.Route("/auth", func(r chi.Router) {
+			r.Get("/status", auth.HandleAuthStatus)
+			r.Post("/login/local", auth.HandleLocalLogin(store))
+			r.Post("/register", auth.HandleLocalRegister(store))
+			r.Get("/me", auth.HandleAuthMe(store))
+			r.Put("/profile", auth.HandleUpdateProfile(store))
+			r.Post("/avatar", auth.HandleUploadAvatar(store))
+			r.Delete("/avatar", auth.HandleDeleteAvatar(store))
+		})
 		// Route for canvases, protected by JWT auth
 		r.Group(func(r chi.Router) {
 			r.Use(authMiddleware.AuthJWT)
@@ -177,15 +190,65 @@ func setupRouter(store stores.Store) *chi.Mux {
 					r.Put("/workspace", kv.HandleMoveCanvasWorkspace(store))
 				})
 			})
-			// Workspaces 画布分组管理（AstraDraw 迁移阶段 1）
+			// Workspace Shell（阶段 1.5：对齐 AstraDraw 客户端形状，1A+2A）
+			r.Post("/workspaces/join", workspaceapi.HandleJoinWorkspace(store))
 			r.Route("/workspaces", func(r chi.Router) {
-				r.Get("/", kv.HandleListWorkspaces(store))
-				r.Post("/", kv.HandleCreateWorkspace(store))
+				r.Get("/", workspaceapi.HandleListWorkspaces(store))
+				r.Post("/", workspaceapi.HandleCreateWorkspace(store))
 				r.Route("/{id}", func(r chi.Router) {
-					r.Put("/", kv.HandleUpdateWorkspace(store))
-					r.Delete("/", kv.HandleDeleteWorkspace(store))
+					r.Get("/", workspaceapi.HandleGetWorkspace(store))
+					r.Put("/", workspaceapi.HandleUpdateWorkspace(store))
+					r.Post("/avatar", workspaceapi.HandleUploadWorkspaceAvatar(store))
+					r.Delete("/", workspaceapi.HandleDeleteWorkspace(store))
+					r.Route("/members", func(r chi.Router) {
+						r.Get("/", workspaceapi.HandleListMembers(store))
+						r.Post("/invite", workspaceapi.HandleInviteMember(store))
+						r.Route("/{memberId}", func(r chi.Router) {
+							r.Put("/", workspaceapi.HandleUpdateMember(store))
+							r.Delete("/", workspaceapi.HandleRemoveMember(store))
+						})
+					})
+					r.Route("/invite-links", func(r chi.Router) {
+						r.Get("/", workspaceapi.HandleListInviteLinks(store))
+						r.Post("/", workspaceapi.HandleCreateInviteLink(store))
+						r.Delete("/{linkId}", workspaceapi.HandleDeleteInviteLink(store))
+					})
+					r.Route("/collections", func(r chi.Router) {
+						r.Get("/", workspaceapi.HandleListCollections(store))
+						r.Post("/", workspaceapi.HandleCreateCollection(store))
+					})
 				})
 			})
+			r.Route("/collections", func(r chi.Router) {
+				r.Route("/{id}", func(r chi.Router) {
+					r.Get("/", workspaceapi.HandleGetCollection(store))
+					r.Put("/", workspaceapi.HandleUpdateCollection(store))
+					r.Delete("/", workspaceapi.HandleDeleteCollection(store))
+					r.Post("/copy-to-workspace", workspaceapi.HandleCopyCollection(store))
+					r.Post("/move-to-workspace", workspaceapi.HandleMoveCollection(store))
+				})
+			})
+			// Scenes 前缀是单数 /workspace/scenes（AstraDraw 约定）
+			r.Route("/workspace/scenes", func(r chi.Router) {
+				r.Get("/", workspaceapi.HandleListScenes(store))
+				r.Post("/", workspaceapi.HandleCreateScene(store))
+				r.Route("/{id}", func(r chi.Router) {
+					r.Get("/", workspaceapi.HandleGetScene(store))
+					r.Put("/", workspaceapi.HandleUpdateScene(store))
+					r.Delete("/", workspaceapi.HandleDeleteScene(store))
+					r.Get("/data", workspaceapi.HandleGetSceneData(store))
+					r.Put("/data", workspaceapi.HandleUpdateSceneData(store))
+					r.Put("/thumbnail", workspaceapi.HandleUploadSceneThumbnail(store))
+					r.Post("/duplicate", workspaceapi.HandleDuplicateScene(store))
+					r.Put("/move", workspaceapi.HandleMoveScene(store))
+					r.Post("/lock", workspaceapi.HandleAcquireSceneLock(store))
+					r.Delete("/lock", workspaceapi.HandleReleaseSceneLock(store))
+					r.Post("/collab", workspaceapi.HandleEnableSceneCollab(store))
+					r.Delete("/collab", workspaceapi.HandleDisableSceneCollab(store))
+				})
+			})
+			// 画布评论 + 站内通知（阶段 4）：路由树在 comments 包内注册
+			commentsapi.Routes(r, store)
 		})
 		// AI chat proxy: NOT behind JWT — the client passes its own OpenAI key
 		// (or the server's OPENAI_API_KEY is used server-side); the proxy just
@@ -309,6 +372,8 @@ func setupSocketIO() *socketio.Server {
 
 			})
 		})
+		// 协作房间内的评论事件转发（阶段 4）
+		registerCommentRelay(socket, sessions, me)
 		socket.On("server-broadcast", func(datas ...any) {
 			if len(datas) < 3 {
 				return

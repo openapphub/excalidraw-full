@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"excalidraw-complete/core"
+	"excalidraw-complete/stores/shellstub"
 	"fmt"
 	"sync"
 	"time"
@@ -23,7 +24,10 @@ var (
 )
 
 // memStore implements both DocumentStore and CanvasStore for in-memory storage.
-type memStore struct{}
+// Workspace Shell 暂未落地，嵌入 shellstub.Unsupported 满足接口。
+type memStore struct {
+	shellstub.Unsupported
+}
 
 // NewStore creates a new in-memory store.
 func NewStore() *memStore {

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"excalidraw-complete/core"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -14,13 +16,24 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func sqliteDSN(dataSourceName string) string {
+	if strings.Contains(dataSourceName, "busy_timeout") {
+		return dataSourceName
+	}
+	sep := "?"
+	if strings.Contains(dataSourceName, "?") {
+		sep = "&"
+	}
+	return dataSourceName + sep + "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+}
+
 type sqliteStore struct {
 	db *sql.DB
 }
 
 // NewStore creates a new SQLite-based store.
 func NewStore(dataSourceName string) *sqliteStore {
-	db, err := sql.Open("sqlite", dataSourceName)
+	db, err := sql.Open("sqlite", sqliteDSN(dataSourceName))
 	if err != nil {
 		log.Fatalf("failed to open sqlite database: %v", err)
 	}
@@ -55,6 +68,8 @@ CREATE TABLE IF NOT EXISTS canvases (
 		}
 		logrus.Info("Migrated canvases table: added workspace_id column")
 	}
+
+	ensureCanvasEditLockColumns(db)
 
 	// Initialize table for workspaces (canvas groups)
 	// 注意：主键是 (user_id, id) 而非单列 id —— default 分组每用户各一行，
@@ -103,7 +118,19 @@ CREATE TABLE IF NOT EXISTS workspaces (
 		logrus.WithField("users", len(users)).Info("Seeded default workspaces for existing users")
 	}
 
-	return &sqliteStore{db}
+	// Workspace Shell（阶段 1.5）：建表 + 老分组迁移为集合
+	ensureShellSchema(db)
+
+	// 画布评论 + 通知（阶段 4）
+	ensureCommentSchema(db)
+	ensureLocalAuthSchema(db)
+
+	store := &sqliteStore{db}
+	if err = store.MigrateLegacyGroupsToShell(context.Background()); err != nil {
+		log.Fatalf("failed to migrate legacy groups to workspace shell: %v", err)
+	}
+
+	return store
 }
 
 // columnExists checks whether a column exists in a table via PRAGMA table_info.
@@ -188,10 +215,17 @@ func (s *sqliteStore) List(ctx context.Context, userID string) ([]*core.Canvas, 
 }
 
 func (s *sqliteStore) Get(ctx context.Context, userID, id string) (*core.Canvas, error) {
+	r, _, err := s.sceneAccess(ctx, userID, id)
+	if err != nil {
+		if errors.Is(err, core.ErrNotFound) || errors.Is(err, core.ErrForbidden) {
+			return nil, fmt.Errorf("canvas not found")
+		}
+		return nil, err
+	}
 	var canvas core.Canvas
-	canvas.UserID = userID
+	canvas.UserID = r.ownerID
 	canvas.ID = id
-	err := s.db.QueryRowContext(ctx, "SELECT name, data, created_at, updated_at, thumbnail, workspace_id FROM canvases WHERE user_id = ? AND id = ?", userID, id).Scan(&canvas.Name, &canvas.Data, &canvas.CreatedAt, &canvas.UpdatedAt, &canvas.Thumbnail, &canvas.WorkspaceID)
+	err = s.db.QueryRowContext(ctx, "SELECT name, data, created_at, updated_at, thumbnail, workspace_id FROM canvases WHERE user_id = ? AND id = ?", r.ownerID, id).Scan(&canvas.Name, &canvas.Data, &canvas.CreatedAt, &canvas.UpdatedAt, &canvas.Thumbnail, &canvas.WorkspaceID)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("canvas not found")
@@ -213,20 +247,24 @@ func (s *sqliteStore) Save(ctx context.Context, canvas *core.Canvas) error {
 		canvas.WorkspaceID = core.DefaultWorkspaceID
 	}
 
-	var exists bool
-	err = tx.QueryRowContext(ctx, "SELECT 1 FROM canvases WHERE user_id = ? AND id = ?", canvas.UserID, canvas.ID).Scan(&exists)
-
 	now := time.Now()
-	if err != nil && err != sql.ErrNoRows {
-		return err
-	}
-
-	if exists {
-		// Update
-		_, err = tx.ExecContext(ctx, "UPDATE canvases SET name = ?, data = ?, updated_at = ?, thumbnail = ?, workspace_id = ? WHERE user_id = ? AND id = ?", canvas.Name, canvas.Data, now, canvas.Thumbnail, canvas.WorkspaceID, canvas.UserID, canvas.ID)
-	} else {
-		// Insert
+	r, canEdit, accessErr := s.sceneAccess(ctx, canvas.UserID, canvas.ID)
+	if accessErr == nil {
+		if !canEdit {
+			return core.ErrForbidden
+		}
+		if err := s.rejectIfExclusiveLockHeld(ctx, canvas.UserID, canvas.ID); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, "UPDATE canvases SET name = ?, data = ?, updated_at = ?, thumbnail = ?, workspace_id = ? WHERE user_id = ? AND id = ?", canvas.Name, canvas.Data, now, canvas.Thumbnail, canvas.WorkspaceID, r.ownerID, r.id)
+	} else if errors.Is(accessErr, core.ErrNotFound) {
+		// 禁止把浏览器 IndexedDB UUID 插入 SQLite，否则 Workspace 会混入本地脏数据。
+		if isIndexedDBCanvasID(canvas.ID) {
+			return fmt.Errorf("refusing to persist indexeddb canvas id")
+		}
 		_, err = tx.ExecContext(ctx, "INSERT INTO canvases (id, user_id, name, data, created_at, updated_at, thumbnail, workspace_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", canvas.ID, canvas.UserID, canvas.Name, canvas.Data, now, now, canvas.Thumbnail, canvas.WorkspaceID)
+	} else {
+		return accessErr
 	}
 
 	if err != nil {

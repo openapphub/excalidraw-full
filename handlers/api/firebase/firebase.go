@@ -144,3 +144,13 @@ func HandleBatchGet() http.HandlerFunc {
 		render.JSON(w, r, responses)
 	}
 }
+
+// HandleListenChannel 接住 SDK 改写 host 后打到本机的 Firestore Listen。
+// 以前这条路 404，客户端会狂重试，协作体感变慢。这里返回 200 空通道结束。
+func HandleListenChannel() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("{}\n"))
+	}
+}
