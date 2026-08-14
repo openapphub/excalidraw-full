@@ -15,6 +15,7 @@ import (
 type Store interface {
 	core.DocumentStore
 	core.CanvasStore
+	core.WorkspaceStore
 }
 
 func GetStore() Store {

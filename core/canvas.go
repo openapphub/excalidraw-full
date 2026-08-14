@@ -8,13 +8,14 @@ import (
 type (
 	// Canvas represents the metadata and content of a user-saved drawing.
 	Canvas struct {
-		ID        string    `json:"id"`
-		UserID    string    `json:"-"` // Not exposed in JSON responses, used internally.
-		Name      string    `json:"name"`
-		Thumbnail string    `json:"thumbnail,omitempty"`
-		Data      []byte    `json:"data,omitempty"` // The full canvas data, not included in list views.
-		CreatedAt time.Time `json:"createdAt"`
-		UpdatedAt time.Time `json:"updatedAt"`
+		ID          string    `json:"id"`
+		UserID      string    `json:"-"` // Not exposed in JSON responses, used internally.
+		Name        string    `json:"name"`
+		Thumbnail   string    `json:"thumbnail,omitempty"`
+		WorkspaceID string    `json:"workspaceId"`
+		Data        []byte    `json:"data,omitempty"` // The full canvas data, not included in list views.
+		CreatedAt   time.Time `json:"createdAt"`
+		UpdatedAt   time.Time `json:"updatedAt"`
 	}
 
 	// CanvasStore defines the persistence layer for user-owned canvases.

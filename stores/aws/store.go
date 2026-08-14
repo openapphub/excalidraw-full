@@ -211,3 +211,156 @@ func (s *s3Store) Delete(ctx context.Context, userID, id string) error {
 	}
 	return nil
 }
+
+// WorkspaceStore implementation for S3 storage.
+// Workspaces are persisted as a single JSON object (workspaces.json) under the user's prefix.
+func (s *s3Store) loadWorkspaces(ctx context.Context, userID string) (map[string]*core.Workspace, error) {
+	workspaces := make(map[string]*core.Workspace)
+	resp, err := s.s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(path.Join(userID, "workspaces.json")),
+	})
+	if err != nil {
+		var nsk *s3types.NoSuchKey
+		if errors.As(err, &nsk) {
+			return workspaces, nil
+		}
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 0 {
+		if err := json.Unmarshal(data, &workspaces); err != nil {
+			return nil, err
+		}
+	}
+	return workspaces, nil
+}
+
+func (s *s3Store) saveWorkspaces(ctx context.Context, userID string, workspaces map[string]*core.Workspace) error {
+	data, err := json.Marshal(workspaces)
+	if err != nil {
+		return err
+	}
+	_, err = s.s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(path.Join(userID, "workspaces.json")),
+		Body:   bytes.NewReader(data),
+	})
+	return err
+}
+
+func (s *s3Store) ListWorkspaces(ctx context.Context, userID string) ([]*core.Workspace, error) {
+	workspaces, err := s.loadWorkspaces(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 懒创建：首次访问（无任何 workspace）时补 default 分组
+	if len(workspaces) == 0 {
+		now := time.Now()
+		workspaces[core.DefaultWorkspaceID] = &core.Workspace{
+			ID:        core.DefaultWorkspaceID,
+			Name:      "默认分组",
+			Note:      "",
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if err := s.saveWorkspaces(ctx, userID, workspaces); err != nil {
+			return nil, err
+		}
+	}
+
+	list := make([]*core.Workspace, 0, len(workspaces))
+	for _, ws := range workspaces {
+		list = append(list, ws)
+	}
+	return list, nil
+}
+
+func (s *s3Store) CreateWorkspace(ctx context.Context, userID, name, note string) (*core.Workspace, error) {
+	workspaces, err := s.loadWorkspaces(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now()
+	ws := &core.Workspace{
+		ID:        ulid.Make().String(),
+		Name:      name,
+		Note:      note,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	workspaces[ws.ID] = ws
+	if err := s.saveWorkspaces(ctx, userID, workspaces); err != nil {
+		return nil, err
+	}
+	return ws, nil
+}
+
+func (s *s3Store) UpdateWorkspace(ctx context.Context, userID, id, name, note string) error {
+	workspaces, err := s.loadWorkspaces(ctx, userID)
+	if err != nil {
+		return err
+	}
+	ws, ok := workspaces[id]
+	if !ok {
+		return fmt.Errorf("workspace not found")
+	}
+	ws.Name = name
+	ws.Note = note
+	ws.UpdatedAt = time.Now()
+	return s.saveWorkspaces(ctx, userID, workspaces)
+}
+
+func (s *s3Store) DeleteWorkspace(ctx context.Context, userID, id string) error {
+	if id == core.DefaultWorkspaceID {
+		return core.ErrDeleteDefaultWorkspace
+	}
+
+	workspaces, err := s.loadWorkspaces(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if _, ok := workspaces[id]; !ok {
+		return fmt.Errorf("workspace not found")
+	}
+
+	// 删除前先把该组画布迁回 default（画布是 JSON 对象，逐个回写）
+	canvases, err := s.List(ctx, userID)
+	if err != nil {
+		return err
+	}
+	for _, canvas := range canvases {
+		if canvas.WorkspaceID == id {
+			canvas.WorkspaceID = core.DefaultWorkspaceID
+			if err := s.Save(ctx, canvas); err != nil {
+				return err
+			}
+		}
+	}
+
+	delete(workspaces, id)
+	return s.saveWorkspaces(ctx, userID, workspaces)
+}
+
+func (s *s3Store) MoveCanvasWorkspace(ctx context.Context, userID, canvasID, workspaceID string) error {
+	workspaces, err := s.loadWorkspaces(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if _, ok := workspaces[workspaceID]; !ok {
+		return fmt.Errorf("workspace not found")
+	}
+
+	canvas, err := s.Get(ctx, userID, canvasID)
+	if err != nil {
+		return fmt.Errorf("canvas not found")
+	}
+	canvas.WorkspaceID = workspaceID
+	return s.Save(ctx, canvas)
+}

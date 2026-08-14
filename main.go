@@ -173,6 +173,17 @@ func setupRouter(store stores.Store) *chi.Mux {
 					r.Get("/", kv.HandleGetCanvas(store))
 					r.Put("/", kv.HandleSaveCanvas(store))
 					r.Delete("/", kv.HandleDeleteCanvas(store))
+					// 画布移组：PUT /api/v2/kv/{key}/workspace {workspaceId}
+					r.Put("/workspace", kv.HandleMoveCanvasWorkspace(store))
+				})
+			})
+			// Workspaces 画布分组管理（AstraDraw 迁移阶段 1）
+			r.Route("/workspaces", func(r chi.Router) {
+				r.Get("/", kv.HandleListWorkspaces(store))
+				r.Post("/", kv.HandleCreateWorkspace(store))
+				r.Route("/{id}", func(r chi.Router) {
+					r.Put("/", kv.HandleUpdateWorkspace(store))
+					r.Delete("/", kv.HandleDeleteWorkspace(store))
 				})
 			})
 		})

@@ -16,7 +16,10 @@ var (
 	// savedCanvases is a map where the key is userID, and the value is another map
 	// where the key is canvasID and the value is the canvas itself.
 	savedCanvases = make(map[string]map[string]*core.Canvas)
-	mu            sync.RWMutex
+	// savedWorkspaces is a map where the key is userID, and the value is another
+	// map where the key is workspaceID and the value is the workspace itself.
+	savedWorkspaces = make(map[string]map[string]*core.Workspace)
+	mu              sync.RWMutex
 )
 
 // memStore implements both DocumentStore and CanvasStore for in-memory storage.
@@ -71,12 +74,13 @@ func (s *memStore) List(ctx context.Context, userID string) ([]*core.Canvas, err
 	for _, canvas := range userCanvases {
 		// Important: create a copy without the large `Data` field for the list view
 		listCanvas := &core.Canvas{
-			ID:        canvas.ID,
-			UserID:    canvas.UserID,
-			Name:      canvas.Name,
-			Thumbnail: canvas.Thumbnail,
-			CreatedAt: canvas.CreatedAt,
-			UpdatedAt: canvas.UpdatedAt,
+			ID:          canvas.ID,
+			UserID:      canvas.UserID,
+			Name:        canvas.Name,
+			Thumbnail:   canvas.Thumbnail,
+			WorkspaceID: canvas.WorkspaceID,
+			CreatedAt:   canvas.CreatedAt,
+			UpdatedAt:   canvas.UpdatedAt,
 		}
 		canvases = append(canvases, listCanvas)
 	}
@@ -138,6 +142,11 @@ func (s *memStore) Save(ctx context.Context, canvas *core.Canvas) error {
 		canvas.UpdatedAt = now
 	}
 
+	// 画布未指定分组时默认归入 default
+	if canvas.WorkspaceID == "" {
+		canvas.WorkspaceID = core.DefaultWorkspaceID
+	}
+
 	userCanvases[canvas.ID] = canvas
 	log.Info("Canvas saved successfully")
 	return nil
@@ -163,5 +172,105 @@ func (s *memStore) Delete(ctx context.Context, userID, id string) error {
 
 	delete(userCanvases, id)
 	log.Info("Canvas deleted successfully")
+	return nil
+}
+
+// WorkspaceStore implementation (in-memory)
+func (s *memStore) ListWorkspaces(ctx context.Context, userID string) ([]*core.Workspace, error) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	// 懒创建：首次访问（无任何 workspace 行）时补 default 分组
+	if _, ok := savedWorkspaces[userID]; !ok {
+		savedWorkspaces[userID] = make(map[string]*core.Workspace)
+	}
+	if len(savedWorkspaces[userID]) == 0 {
+		now := time.Now()
+		savedWorkspaces[userID][core.DefaultWorkspaceID] = &core.Workspace{
+			ID:        core.DefaultWorkspaceID,
+			Name:      "默认分组",
+			Note:      "",
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+	}
+
+	workspaces := make([]*core.Workspace, 0, len(savedWorkspaces[userID]))
+	for _, ws := range savedWorkspaces[userID] {
+		workspaces = append(workspaces, ws)
+	}
+	return workspaces, nil
+}
+
+func (s *memStore) CreateWorkspace(ctx context.Context, userID, name, note string) (*core.Workspace, error) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if _, ok := savedWorkspaces[userID]; !ok {
+		savedWorkspaces[userID] = make(map[string]*core.Workspace)
+	}
+
+	now := time.Now()
+	ws := &core.Workspace{
+		ID:        ulid.Make().String(),
+		Name:      name,
+		Note:      note,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	savedWorkspaces[userID][ws.ID] = ws
+	return ws, nil
+}
+
+func (s *memStore) UpdateWorkspace(ctx context.Context, userID, id, name, note string) error {
+	mu.Lock()
+	defer mu.Unlock()
+
+	ws, ok := savedWorkspaces[userID][id]
+	if !ok {
+		return fmt.Errorf("workspace not found")
+	}
+	ws.Name = name
+	ws.Note = note
+	ws.UpdatedAt = time.Now()
+	return nil
+}
+
+func (s *memStore) DeleteWorkspace(ctx context.Context, userID, id string) error {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if id == core.DefaultWorkspaceID {
+		return core.ErrDeleteDefaultWorkspace
+	}
+
+	if _, ok := savedWorkspaces[userID][id]; !ok {
+		return fmt.Errorf("workspace not found")
+	}
+
+	// 删除前先把该组画布迁回 default
+	for _, canvas := range savedCanvases[userID] {
+		if canvas.WorkspaceID == id {
+			canvas.WorkspaceID = core.DefaultWorkspaceID
+		}
+	}
+
+	delete(savedWorkspaces[userID], id)
+	return nil
+}
+
+func (s *memStore) MoveCanvasWorkspace(ctx context.Context, userID, canvasID, workspaceID string) error {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if _, ok := savedWorkspaces[userID][workspaceID]; !ok {
+		return fmt.Errorf("workspace not found")
+	}
+
+	canvas, ok := savedCanvases[userID][canvasID]
+	if !ok {
+		return fmt.Errorf("canvas not found")
+	}
+	canvas.WorkspaceID = workspaceID
 	return nil
 }
