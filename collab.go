@@ -1,24 +1,53 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"excalidraw-complete/core"
+	"excalidraw-complete/handlers/api/roomaccess"
+	"excalidraw-complete/stores"
 	"strings"
 	"sync"
+	"time"
 
 	socketio "github.com/zishang520/socket.io/v2/socket"
 )
 
 const followRoomPrefix = "follow@"
 
+type roomJoinedPayload struct {
+	RoomID   string              `json:"roomId"`
+	SocketID string              `json:"socketId"`
+	Clients  []socketio.SocketId `json:"clients"`
+}
+
+func newRoomJoinedPayload(
+	room socketio.Room,
+	socketID socketio.SocketId,
+	clients []socketio.SocketId,
+) roomJoinedPayload {
+	return roomJoinedPayload{
+		RoomID:   string(room),
+		SocketID: string(socketID),
+		Clients:  clients,
+	}
+}
+
 type collabSession struct {
-	room     socketio.Room
-	clientID string
+	room        socketio.Room
+	clientID    string
+	access      roomaccess.Access
+	validatedAt time.Time
 }
 
 type collabSessionRegistry struct {
 	mu              sync.RWMutex
 	bySocket        map[socketio.SocketId]collabSession
 	socketBySession map[string]socketio.SocketId
+}
+
+type sceneRealtimeWriteChecker interface {
+	CheckSceneRealtimeWrite(ctx context.Context, userID, sceneID string) error
 }
 
 func newCollabSessionRegistry() *collabSessionRegistry {
@@ -36,6 +65,7 @@ func (r *collabSessionRegistry) claim(
 	socketID socketio.SocketId,
 	room socketio.Room,
 	clientID string,
+	accessValues ...roomaccess.Access,
 ) (previousRoom socketio.Room, replacedSocket socketio.SocketId) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -50,7 +80,16 @@ func (r *collabSessionRegistry) claim(
 		}
 	}
 
-	r.bySocket[socketID] = collabSession{room: room, clientID: clientID}
+	access := roomaccess.Access{}
+	if len(accessValues) > 0 {
+		access = accessValues[0]
+	}
+	r.bySocket[socketID] = collabSession{
+		room:        room,
+		clientID:    clientID,
+		access:      access,
+		validatedAt: time.Now(),
+	}
 	if clientID != "" {
 		key := collabSessionKey(room, clientID)
 		replacedSocket = r.socketBySession[key]
@@ -88,6 +127,110 @@ func (r *collabSessionRegistry) roomFor(socketID socketio.SocketId) (socketio.Ro
 	return session.room, ok
 }
 
+func (r *collabSessionRegistry) sessionFor(socketID socketio.SocketId) (collabSession, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	session, ok := r.bySocket[socketID]
+	return session, ok
+}
+
+func (r *collabSessionRegistry) sessionsInRoom(room socketio.Room) map[socketio.SocketId]collabSession {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	result := make(map[socketio.SocketId]collabSession)
+	for socketID, session := range r.bySocket {
+		if session.room == room {
+			result[socketID] = session
+		}
+	}
+	return result
+}
+
+// validate 重新确认持久化 Scene 的 ACL。高频光标事件最多每秒查一次，可靠
+// 内容事件强制实时检查，从而使成员移除或角色降级尽快生效。
+func (r *collabSessionRegistry) validate(
+	ctx context.Context,
+	store stores.Store,
+	socketID socketio.SocketId,
+	requireWrite bool,
+	force bool,
+) bool {
+	session, ok := r.sessionFor(socketID)
+	if !ok {
+		return false
+	}
+	if !session.access.WorkspaceScene {
+		return true
+	}
+	if !force && time.Since(session.validatedAt) < time.Second {
+		return !requireWrite || session.access.CanEdit
+	}
+
+	scene, err := store.GetScene(ctx, session.access.UserID, string(session.room))
+	if err != nil {
+		return false
+	}
+
+	r.mu.Lock()
+	current, exists := r.bySocket[socketID]
+	if exists && current.room == session.room && current.access.UserID == session.access.UserID {
+		current.access.CanEdit = scene.CanEdit
+		current.validatedAt = time.Now()
+		r.bySocket[socketID] = current
+	}
+	r.mu.Unlock()
+	return !requireWrite || scene.CanEdit
+}
+
+// validateContentWrite 除成员 ACL 外，还校验 Workspace Scene 的编辑模式：
+// 独占模式必须由当前 clientId 持锁，协作模式则允许所有可编辑成员广播，
+// 最终 SQLite 持久化仍由主写者租约约束。匿名临时房间不涉及 Workspace 锁。
+func (r *collabSessionRegistry) validateContentWrite(
+	ctx context.Context,
+	store stores.Store,
+	socketID socketio.SocketId,
+) bool {
+	if !r.validate(ctx, store, socketID, true, true) {
+		return false
+	}
+
+	session, ok := r.sessionFor(socketID)
+	if !ok {
+		return false
+	}
+	if !session.access.WorkspaceScene {
+		return true
+	}
+
+	checker, ok := store.(sceneRealtimeWriteChecker)
+	if !ok {
+		return false
+	}
+	ctx = core.WithSceneClientID(ctx, session.clientID)
+	return checker.CheckSceneRealtimeWrite(
+		ctx,
+		session.access.UserID,
+		string(session.room),
+	) == nil
+}
+
+func (r *collabSessionRegistry) pruneUnauthorized(
+	ctx context.Context,
+	ioo *socketio.Server,
+	store stores.Store,
+	room socketio.Room,
+	force bool,
+) {
+	for socketID, session := range r.sessionsInRoom(room) {
+		if !session.access.WorkspaceScene || r.validate(ctx, store, socketID, false, force) {
+			continue
+		}
+		r.release(socketID)
+		ioo.In(socketio.Room(socketID)).DisconnectSockets(true)
+	}
+}
+
 func (r *collabSessionRegistry) sameRoom(first, second socketio.SocketId) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -106,8 +249,10 @@ const commentEventName = "comment:event"
 //
 // 载荷不落库，只做转发；权限由 REST 层把关（这里仅限制必须在自己房间内）。
 func registerCommentRelay(
+	ioo *socketio.Server,
 	socket *socketio.Socket,
 	sessions *collabSessionRegistry,
+	store stores.Store,
 	me socketio.SocketId,
 ) {
 	socket.On(commentEventName, func(datas ...any) {
@@ -122,8 +267,32 @@ func registerCommentRelay(
 		if !joined || string(joinedRoom) != roomID {
 			return
 		}
+		if !sessions.validate(context.Background(), store, me, false, true) {
+			sessions.release(me)
+			socket.Disconnect(true)
+			return
+		}
+		sessions.pruneUnauthorized(context.Background(), ioo, store, joinedRoom, true)
 		socket.Broadcast().To(socketio.Room(roomID)).Emit(commentEventName, datas[1])
 	})
+}
+
+func socketAuthToken(socket *socketio.Socket) string {
+	handshake := socket.Handshake()
+	if handshake == nil || handshake.Auth == nil {
+		return ""
+	}
+	encoded, err := json.Marshal(handshake.Auth)
+	if err != nil {
+		return ""
+	}
+	var payload struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(encoded, &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Token)
 }
 
 func parseJoinRoomData(datas []any) (socketio.Room, string, bool) {

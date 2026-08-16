@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -27,16 +28,14 @@ func newTestStore(t *testing.T) *sqliteStore {
 	return store
 }
 
-// saveTestCanvas 保存一张测试画布（默认归入 default 分组）。
+// saveTestCanvas 构造阶段一旧数据：尚无 Collection，workspace_id 使用旧分组。
 func saveTestCanvas(t *testing.T, store *sqliteStore, userID, id, name string) {
 	t.Helper()
-	canvas := &core.Canvas{
-		ID:     id,
-		UserID: userID,
-		Name:   name,
-		Data:   []byte(`{"type":"excalidraw"}`),
-	}
-	if err := store.Save(context.Background(), canvas); err != nil {
+	now := time.Now().UTC()
+	if _, err := store.db.ExecContext(context.Background(), `
+		INSERT INTO canvases (id, user_id, name, thumbnail, data, workspace_id, collection_id, created_at, updated_at)
+		VALUES (?, ?, ?, '', ?, ?, NULL, ?, ?)`,
+		id, userID, name, []byte(`{"type":"excalidraw"}`), core.DefaultWorkspaceID, now, now); err != nil {
 		t.Fatalf("保存画布失败: %v", err)
 	}
 }
@@ -114,8 +113,8 @@ func TestWorkspacesLifecycle(t *testing.T) {
 	saveTestCanvas(t, store, userID, "canvas-1", "画布一")
 	saveTestCanvas(t, store, userID, "canvas-2", "画布二")
 
-	if err := store.MoveCanvasWorkspace(ctx, userID, "canvas-1", created.ID); err != nil {
-		t.Fatalf("MoveCanvasWorkspace() 错误 = %v", err)
+	if err := store.MoveCanvasWorkspace(ctx, userID, "canvas-1", created.ID); !errors.Is(err, core.ErrInvalidInput) {
+		t.Fatalf("旧 workspace move 错误 = %v，期望 ErrInvalidInput", err)
 	}
 
 	// 验证画布已带 workspace_id（List 与 Get 都读该列）
@@ -124,15 +123,8 @@ func TestWorkspacesLifecycle(t *testing.T) {
 		t.Fatalf("List() 错误 = %v", err)
 	}
 	for _, c := range canvases {
-		switch c.ID {
-		case "canvas-1":
-			if c.WorkspaceID != created.ID {
-				t.Fatalf("canvas-1 workspace_id = %q，期望 %q", c.WorkspaceID, created.ID)
-			}
-		case "canvas-2":
-			if c.WorkspaceID != core.DefaultWorkspaceID {
-				t.Fatalf("canvas-2 workspace_id = %q，期望 %q", c.WorkspaceID, core.DefaultWorkspaceID)
-			}
+		if c.WorkspaceID != core.DefaultWorkspaceID {
+			t.Fatalf("旧画布 workspace_id = %q，期望保持 %q", c.WorkspaceID, core.DefaultWorkspaceID)
 		}
 	}
 
@@ -140,8 +132,8 @@ func TestWorkspacesLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get() 错误 = %v", err)
 	}
-	if got.WorkspaceID != created.ID {
-		t.Fatalf("Get() workspace_id = %q，期望 %q", got.WorkspaceID, created.ID)
+	if got.WorkspaceID != core.DefaultWorkspaceID {
+		t.Fatalf("Get() workspace_id = %q，期望 %q", got.WorkspaceID, core.DefaultWorkspaceID)
 	}
 
 	// 移组到不存在的分组应报错
@@ -153,7 +145,7 @@ func TestWorkspacesLifecycle(t *testing.T) {
 		t.Fatal("移动不存在的画布应返回错误")
 	}
 
-	// 删除分组：组内画布 canvas-1 迁回 default
+	// 删除空旧分组不影响 Scene 归属。
 	if err := store.DeleteWorkspace(ctx, userID, created.ID); err != nil {
 		t.Fatalf("DeleteWorkspace() 错误 = %v", err)
 	}
@@ -162,7 +154,7 @@ func TestWorkspacesLifecycle(t *testing.T) {
 		t.Fatalf("Get() 错误 = %v", err)
 	}
 	if got.WorkspaceID != core.DefaultWorkspaceID {
-		t.Fatalf("删组后 canvas-1 workspace_id = %q，期望迁回 %q", got.WorkspaceID, core.DefaultWorkspaceID)
+		t.Fatalf("删组后 canvas-1 workspace_id = %q，期望 %q", got.WorkspaceID, core.DefaultWorkspaceID)
 	}
 
 	// 删除不存在的分组应报错
@@ -267,13 +259,17 @@ func TestMigrateLegacyDBAddsWorkspaceColumn(t *testing.T) {
 		t.Fatal("迁移后 canvases 表仍缺少 workspace_id 列")
 	}
 
-	// 旧画布自动归入 default
+	// 旧画布自动归入个人工作区默认 Collection，冗余 workspace_id 必须同步。
 	canvas, err := store.Get(context.Background(), "user-legacy", "legacy-1")
 	if err != nil {
 		t.Fatalf("Get() 错误 = %v", err)
 	}
-	if canvas.WorkspaceID != core.DefaultWorkspaceID {
-		t.Fatalf("旧画布 workspace_id = %q，期望 %q", canvas.WorkspaceID, core.DefaultWorkspaceID)
+	var collectionWorkspaceID string
+	if err := store.db.QueryRow(`SELECT c.workspace_id FROM shell_collections c JOIN canvases cv ON cv.collection_id = c.id WHERE cv.id = ?`, "legacy-1").Scan(&collectionWorkspaceID); err != nil {
+		t.Fatalf("读取迁移后 Collection 工作区失败: %v", err)
+	}
+	if canvas.WorkspaceID != collectionWorkspaceID {
+		t.Fatalf("旧画布 workspace_id = %q，Collection workspace_id = %q", canvas.WorkspaceID, collectionWorkspaceID)
 	}
 
 	// 旧用户自动补 default 分组
@@ -293,20 +289,22 @@ func TestMigrateLegacyDBAddsWorkspaceColumn(t *testing.T) {
 	}
 }
 
-func TestSaveRejectsIndexedDBCanvasID(t *testing.T) {
+func TestSaveRejectsUnknownCanvasID(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	const userID = "user-idb"
 	const uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 
-	err := store.Save(ctx, &core.Canvas{
-		ID:     uuid,
-		UserID: userID,
-		Name:   "from-indexeddb",
-		Data:   []byte(`{"elements":[{"id":"x"}]}`),
-	})
-	if err == nil {
-		t.Fatal("Save IndexedDB UUID 应被拒绝")
+	for _, id := range []string{uuid, "server-shaped-but-missing"} {
+		err := store.Save(ctx, &core.Canvas{
+			ID:     id,
+			UserID: userID,
+			Name:   "from-indexeddb",
+			Data:   []byte(`{"elements":[{"id":"x"}]}`),
+		})
+		if !errors.Is(err, core.ErrNotFound) {
+			t.Fatalf("Save 不存在的 ID %q 错误 = %v，期望 ErrNotFound", id, err)
+		}
 	}
 
 	list, err := store.List(ctx, userID)
@@ -314,8 +312,8 @@ func TestSaveRejectsIndexedDBCanvasID(t *testing.T) {
 		t.Fatalf("List() 错误 = %v", err)
 	}
 	for _, c := range list {
-		if c.ID == uuid {
-			t.Fatal("SQLite 不应留下 IndexedDB UUID 画布")
+		if c.ID == uuid || c.ID == "server-shaped-but-missing" {
+			t.Fatal("SQLite 不应留下 KV PUT 直接创建的画布")
 		}
 	}
 }

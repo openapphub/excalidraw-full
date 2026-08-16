@@ -4,7 +4,7 @@ import (
 	"math"
 	"math/rand"
 	"time"
-	"unicode/utf8"
+	"unicode"
 )
 
 // Format conversion between the mcp-excalidraw "agent format" (text/label/
@@ -181,31 +181,17 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 		if _, ok := base["containerId"]; !ok {
 			base["containerId"] = nil
 		}
-		// Estimate width/height if missing (agent-created text often has none)
+		// 独立文字可能只传宽或高；分别补齐，避免多行文字被固定高度裁剪。
+		fs, _ := num(base["fontSize"])
+		if fs == 0 {
+			fs = 20
+		}
+		textW, textH := textMetrics(text, fs)
 		if w, ok := num(base["width"]); !ok || w == 0 {
-			lines := 1
-			longest := 0
-			cur := 0
-			for _, c := range text {
-				if c == '\n' {
-					lines++
-					if cur > longest {
-						longest = cur
-					}
-					cur = 0
-					continue
-				}
-				cur++
-			}
-			if cur > longest {
-				longest = cur
-			}
-			fs, _ := num(base["fontSize"])
-			if fs == 0 {
-				fs = 20
-			}
-			base["width"] = math.Ceil(float64(longest)*fs*0.6)
-			base["height"] = math.Ceil(float64(lines)*fs*1.25)
+			base["width"] = textW
+		}
+		if h, ok := num(base["height"]); !ok || h == 0 {
+			base["height"] = textH
 		}
 		return base, nil
 	}
@@ -237,11 +223,12 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 		}
 		midX, _ := num(base["x"])
 		midY, _ := num(base["y"])
-		labelW := math.Max(float64(utf8.RuneCountInString(labelText))*10, 60)
+		labelW, labelH := textMetrics(labelText, 14)
+		labelW = math.Max(labelW, 60)
 		textX = midX + lastX/2 - labelW/2
-		textY = midY + lastY/2 - 12
+		textY = midY + lastY/2 - labelH/2
 		textW = labelW
-		textH = 24
+		textH = labelH
 	} else {
 		x, _ := num(base["x"])
 		y, _ := num(base["y"])
@@ -253,18 +240,25 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 		if h == 0 {
 			h = 80
 		}
-		// Center the label on the container using the *estimated text
-		// size*, not the container size. The frontend may auto-resize the
-		// bound text width to the actual glyph width without recomputing
-		// x, so a container-sized box would render off-center. CJK glyphs
-		// are ~1em wide (fs), latin ~0.6em — use rune count, not bytes.
+		// 使用多行文本的实际估算尺寸居中。前端会按字形重算 bound text，
+		// 单行高度或把换行计入总 rune 数都会导致裁剪、偏移。
 		fs := 16.0
 		if f, ok := num(base["fontSize"]); ok && f > 0 {
 			fs = f
 		}
-		runes := utf8.RuneCountInString(labelText)
-		textW = math.Max(float64(runes)*fs, 20)
-		textH = fs * 1.25
+		textW, textH = textMetrics(labelText, fs)
+		// 服务端是最终 native 生成者。即使调用方没有按指南预留空间，
+		// 也保证容器能容纳绑定文字与基础内边距。
+		minW := textW + 32
+		minH := textH + 24
+		if w < minW {
+			w = minW
+			base["width"] = w
+		}
+		if h < minH {
+			h = minH
+			base["height"] = h
+		}
 		textX = x + w/2 - textW/2
 		textY = y + h/2 - textH/2
 	}
@@ -293,6 +287,40 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 		"containerId": id,
 	}
 	return base, textEl
+}
+
+// textMetrics 以显示宽度估算文字盒：CJK 约为 1em，ASCII 约为 0.6em。
+// 它不是排版引擎，但可保证服务端生成的多行 bound text 有足够高度，
+// 且不会把换行符计进一条超长的宽度。
+func textMetrics(text string, fontSize float64) (float64, float64) {
+	if fontSize <= 0 {
+		fontSize = 16
+	}
+	lines := 1
+	lineWidth := 0.0
+	maxWidth := 0.0
+	for _, r := range text {
+		if r == '\n' {
+			if lineWidth > maxWidth {
+				maxWidth = lineWidth
+			}
+			lineWidth = 0
+			lines++
+			continue
+		}
+		switch {
+		case unicode.IsSpace(r):
+			lineWidth += fontSize * 0.35
+		case r <= unicode.MaxASCII:
+			lineWidth += fontSize * 0.6
+		default:
+			lineWidth += fontSize
+		}
+	}
+	if lineWidth > maxWidth {
+		maxWidth = lineWidth
+	}
+	return math.Max(math.Ceil(maxWidth), 20), math.Ceil(float64(lines) * fontSize * 1.25)
 }
 
 // resolveArrowBindings computes edge-to-edge paths for every arrow/line in
@@ -346,7 +374,7 @@ func resolveArrowBindings(native []map[string]interface{}) {
 		const gap = 8.0
 		dx := endPt[0] - startPt[0]
 		dy := endPt[1] - startPt[1]
-		dist := math.Sqrt(dx*dx+dy*dy)
+		dist := math.Sqrt(dx*dx + dy*dy)
 		if dist == 0 {
 			dist = 1
 		}
@@ -355,7 +383,91 @@ func resolveArrowBindings(native []map[string]interface{}) {
 		el["x"] = finalStart[0]
 		el["y"] = finalStart[1]
 		el["points"] = [][]float64{{0, 0}, {finalEnd[0] - finalStart[0], finalEnd[1] - finalStart[1]}}
+		// Excalidraw 线性元素还依赖 width/height 构建 shape。只更新
+		// points 会让箭头只剩标签或退化成极短线段。
+		el["width"] = math.Abs(finalEnd[0] - finalStart[0])
+		el["height"] = math.Abs(finalEnd[1] - finalStart[1])
 	}
+	positionArrowLabels(native)
+}
+
+// positionArrowLabels 在箭头路径解析后重算绑定标签位置。agentToNative
+// 生成标签时尚无最终边到边路径；若不在这里更新，标签会留在默认 (0,0)->(100,0)
+// 的中点，和真实箭头脱离。
+func positionArrowLabels(native []map[string]interface{}) {
+	byID := make(map[string]map[string]interface{}, len(native))
+	for _, el := range native {
+		if id, ok := el["id"].(string); ok && id != "" {
+			byID[id] = el
+		}
+	}
+	for _, arrow := range native {
+		typ, _ := arrow["type"].(string)
+		if typ != "arrow" && typ != "line" {
+			continue
+		}
+		arrowID, _ := arrow["id"].(string)
+		if arrowID == "" {
+			continue
+		}
+		var label map[string]interface{}
+		for _, candidate := range byID {
+			if candidate["type"] == "text" && candidate["containerId"] == arrowID {
+				label = candidate
+				break
+			}
+		}
+		if label == nil {
+			continue
+		}
+		text, _ := label["text"].(string)
+		fontSize, _ := num(label["fontSize"])
+		if fontSize <= 0 {
+			fontSize = 14
+		}
+		textW, textH := textMetrics(text, fontSize)
+		textW = math.Max(textW, 60)
+		midX, midY, ok := arrowPathMidpoint(arrow)
+		if !ok {
+			continue
+		}
+		label["x"] = midX - textW/2
+		label["y"] = midY - textH/2
+		label["width"] = textW
+		label["height"] = textH
+	}
+}
+
+func arrowPathMidpoint(arrow map[string]interface{}) (float64, float64, bool) {
+	points, ok := arrow["points"].([][]float64)
+	if !ok || len(points) < 2 {
+		return 0, 0, false
+	}
+	x, _ := num(arrow["x"])
+	y, _ := num(arrow["y"])
+	total := 0.0
+	for i := 1; i < len(points); i++ {
+		dx := points[i][0] - points[i-1][0]
+		dy := points[i][1] - points[i-1][1]
+		total += math.Hypot(dx, dy)
+	}
+	if total == 0 {
+		return x + points[0][0], y + points[0][1], true
+	}
+	target := total / 2
+	seen := 0.0
+	for i := 1; i < len(points); i++ {
+		dx := points[i][0] - points[i-1][0]
+		dy := points[i][1] - points[i-1][1]
+		segment := math.Hypot(dx, dy)
+		if seen+segment >= target {
+			ratio := (target - seen) / segment
+			return x + points[i-1][0] + dx*ratio, y + points[i-1][1] + dy*ratio, true
+		}
+		seen += segment
+	}
+	last := points[len(points)-1]
+	return x + last[0], y + last[1], true
 }
 
 func centerOf(el map[string]interface{}) [2]float64 {
@@ -415,7 +527,8 @@ func edgePoint(el map[string]interface{}, target [2]float64) [2]float64 {
 // strips Excalidraw internals, converts startBinding/endBinding back to
 // start/end refs. Bound text elements are folded back into their parent's
 // `label` by the caller (load), which has the full element list.
-func nativeToAgent(el map[string]interface{}) map[string]interface{} {	typ, _ := el["type"].(string)
+func nativeToAgent(el map[string]interface{}) map[string]interface{} {
+	typ, _ := el["type"].(string)
 	agent := make(map[string]interface{}, 16)
 	for k, v := range el {
 		switch k {

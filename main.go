@@ -1,21 +1,23 @@
 package main
 
 import (
+	"context"
 	"embed"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	commentsapi "excalidraw-complete/handlers/api/comments"
 	"excalidraw-complete/handlers/api/documents"
 	"excalidraw-complete/handlers/api/firebase"
 	"excalidraw-complete/handlers/api/kv"
 	"excalidraw-complete/handlers/api/mcpcanvas"
 	"excalidraw-complete/handlers/api/openai"
+	"excalidraw-complete/handlers/api/roomaccess"
 	workspaceapi "excalidraw-complete/handlers/api/workspace"
 	"excalidraw-complete/handlers/auth"
 	authMiddleware "excalidraw-complete/middleware"
 	"excalidraw-complete/stores"
 	"flag"
-	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -148,21 +150,21 @@ func handleNotFound() http.HandlerFunc {
 	}
 }
 
-func setupRouter(store stores.Store) *chi.Mux {
+func setupRouter(store stores.Store) (*chi.Mux, *mcpcanvas.Store) {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"https://*", "http://*"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "Content-Length", "X-CSRF-Token", "Token", "session", "Origin", "Host", "Connection", "Accept-Encoding", "Accept-Language", "X-Requested-With", "x-goog-request-params", "x-firebase-appcheck", "x-firebase-client", "x-goog-api-client"},
+		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "Content-Length", "X-CSRF-Token", "X-Scene-Client-ID", "Token", "session", "Origin", "Host", "Connection", "Accept-Encoding", "Accept-Language", "X-Requested-With", "x-goog-request-params", "x-firebase-appcheck", "x-firebase-client", "x-goog-api-client"},
 		AllowCredentials: true,
 		MaxAge:           300, // Maximum value not ignored by any of major browsers
 	}))
 
 	r.Route("/v1/projects/{project_id}/databases/{database_id}", func(r chi.Router) {
-		r.Post("/documents:commit", firebase.HandleBatchCommit())
-		r.Post("/documents:batchGet", firebase.HandleBatchGet())
+		r.Post("/documents:commit", firebase.HandleBatchCommit(store))
+		r.Post("/documents:batchGet", firebase.HandleBatchGet(store))
 	})
 	// firestore.googleapis.com 被改写到本机后，SDK 会打这条 Listen
 	r.Handle("/google.firestore.v1.Firestore/Listen/channel", firebase.HandleListenChannel())
@@ -177,9 +179,16 @@ func setupRouter(store stores.Store) *chi.Mux {
 			r.Post("/avatar", auth.HandleUploadAvatar(store))
 			r.Delete("/avatar", auth.HandleDeleteAvatar(store))
 		})
+		// 临时 #room 协作允许匿名访问，但仍由 roomaccess 校验随机房间格式；
+		// 若 room id 对应 Workspace Scene，则必须通过 JWT ACL 与编辑锁。
+		r.Route("/collab/rooms/{room_id}", func(r chi.Router) {
+			r.Get("/", firebase.HandleRoomSnapshotGet(store))
+			r.Put("/", firebase.HandleRoomSnapshotPut(store))
+		})
 		// Route for canvases, protected by JWT auth
 		r.Group(func(r chi.Router) {
 			r.Use(authMiddleware.AuthJWT)
+			r.Get("/search/global", workspaceapi.HandleGlobalSearch(store))
 			r.Route("/kv", func(r chi.Router) {
 				r.Get("/", kv.HandleListCanvases(store))
 				r.Route("/{key}", func(r chi.Router) {
@@ -258,8 +267,8 @@ func setupRouter(store stores.Store) *chi.Mux {
 			r.Post("/completions", openai.HandleChatCompletion())
 		})
 
-		// Old routes for anonymous document sharing
-		r.Post("/post/", documents.HandleCreate(store))
+		// 分享链接正文可匿名读取，但创建会把加密快照写入服务端存储，必须登录。
+		r.With(authMiddleware.AuthJWT).Post("/post/", documents.HandleCreate(store))
 		r.Route("/{id}", func(r chi.Router) {
 			r.Get("/", documents.HandleGet(store))
 		})
@@ -275,7 +284,7 @@ func setupRouter(store stores.Store) *chi.Mux {
 	// can never signal this process (we are the host app, not a disposable
 	// canvas server). /api/files answers 200 with empty files so the CLI's
 	// export never fails on the image-files lookup.
-	mcStore, err := mcpcanvas.NewStore("")
+	mcStore, err := mcpcanvas.NewStore("", store)
 	if err != nil {
 		logrus.WithError(err).Fatal("failed to init mcpcanvas store")
 	}
@@ -288,13 +297,16 @@ func setupRouter(store stores.Store) *chi.Mux {
 		})
 	})
 	r.Route("/api/elements", func(r chi.Router) {
+		r.Use(authMiddleware.AuthJWT)
 		mcpcanvas.Routes(r, mcStore)
 	})
 	r.Route("/api/canvas", func(r chi.Router) {
+		r.Use(authMiddleware.AuthJWT)
 		mcpcanvas.CanvasRoutes(r, mcStore)
 	})
-	r.Get("/ws", mcStore.ServeWS)
+	r.With(authMiddleware.AuthWebSocketJWT).Get("/ws", mcStore.ServeWS)
 	r.Route("/api/snapshots", func(r chi.Router) {
+		r.Use(authMiddleware.AuthJWT)
 		mcpcanvas.SnapshotRoutes(r, mcStore)
 	})
 	r.Route("/v0/b/{bucket}", func(r chi.Router) {
@@ -307,7 +319,7 @@ func setupRouter(store stores.Store) *chi.Mux {
 		w.WriteHeader(http.StatusOK)
 	})
 
-	return r
+	return r, mcStore
 }
 
 func writeJSONHealth(w http.ResponseWriter, v interface{}) {
@@ -315,7 +327,7 @@ func writeJSONHealth(w http.ResponseWriter, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func setupSocketIO() *socketio.Server {
+func setupSocketIO(store stores.Store) *socketio.Server {
 	opts := socketio.DefaultServerOptions()
 	opts.SetMaxHttpBufferSize(5000000)
 	opts.SetPath("/socket.io")
@@ -331,6 +343,7 @@ func setupSocketIO() *socketio.Server {
 		socket := clients[0].(*socketio.Socket)
 		me := socket.Id()
 		myRoom := socketio.Room(me)
+		token := socketAuthToken(socket)
 		socket.Emit("init-room")
 		utils.Log().Printf("init room %v\n", myRoom)
 		socket.On("join-room", func(datas ...any) {
@@ -339,8 +352,15 @@ func setupSocketIO() *socketio.Server {
 				utils.Log().Printf("Socket %v sent invalid join-room payload\n", me)
 				return
 			}
+			access, err := roomaccess.Authorize(context.Background(), store, string(room), token)
+			if err != nil {
+				utils.Log().Printf("Socket %v was denied access to room %v\n", me, room)
+				socket.Emit("room-error", "无权访问该协作房间")
+				socket.Disconnect(true)
+				return
+			}
 
-			previousRoom, replacedSocket := sessions.claim(me, room, clientID)
+			previousRoom, replacedSocket := sessions.claim(me, room, clientID, access)
 			if previousRoom != "" && previousRoom != room {
 				socket.Leave(previousRoom)
 			}
@@ -357,6 +377,10 @@ func setupSocketIO() *socketio.Server {
 			}
 			ioo.In(room).FetchSockets()(func(usersInRoom []*socketio.RemoteSocket, _ error) {
 				newRoomUsers := socketIDsExcluding(usersInRoom, replacedSocket)
+				ioo.To(myRoom).Emit(
+					"room-joined",
+					newRoomJoinedPayload(room, me, newRoomUsers),
+				)
 				if len(newRoomUsers) <= 1 {
 					ioo.To(myRoom).Emit("first-in-room")
 				} else {
@@ -373,7 +397,7 @@ func setupSocketIO() *socketio.Server {
 			})
 		})
 		// 协作房间内的评论事件转发（阶段 4）
-		registerCommentRelay(socket, sessions, me)
+		registerCommentRelay(ioo, socket, sessions, store, me)
 		socket.On("server-broadcast", func(datas ...any) {
 			if len(datas) < 3 {
 				return
@@ -384,6 +408,14 @@ func setupSocketIO() *socketio.Server {
 				utils.Log().Printf("Socket %v attempted broadcast outside its room %v\n", me, roomID)
 				return
 			}
+			if !sessions.validateContentWrite(context.Background(), store, me) {
+				utils.Log().Printf("Socket %v lost write access to room %v\n", me, roomID)
+				sessions.release(me)
+				socket.Emit("room-error", "已失去该协作房间的编辑权限")
+				socket.Disconnect(true)
+				return
+			}
+			sessions.pruneUnauthorized(context.Background(), ioo, store, joinedRoom, true)
 			utils.Log().Printf(" user %v sends update to room %v\n", me, roomID)
 			socket.Broadcast().To(socketio.Room(roomID)).Emit("client-broadcast", datas[1], datas[2])
 		})
@@ -404,6 +436,20 @@ func setupSocketIO() *socketio.Server {
 				utils.Log().Printf("Socket %v attempted volatile broadcast outside its room %v\n", me, roomID)
 				return
 			}
+			if isMainRoom {
+				if !sessions.validate(context.Background(), store, me, true, false) {
+					utils.Log().Printf("Socket %v cannot publish to room %v\n", me, roomID)
+					return
+				}
+				sessions.pruneUnauthorized(context.Background(), ioo, store, joinedRoom, false)
+			}
+			if isFollowRoom {
+				if !joined || !sessions.validate(context.Background(), store, me, true, false) {
+					utils.Log().Printf("Socket %v cannot publish follow updates for room %v\n", me, roomID)
+					return
+				}
+				sessions.pruneUnauthorized(context.Background(), ioo, store, joinedRoom, false)
+			}
 			utils.Log().Printf(" user %v sends volatile update to room %v\n", me, roomID)
 			socket.Volatile().Broadcast().To(socketio.Room(roomID)).Emit("client-broadcast", datas[1], datas[2])
 		})
@@ -417,6 +463,15 @@ func setupSocketIO() *socketio.Server {
 				utils.Log().Printf("Socket %v sent invalid user-follow payload\n", me)
 				return
 			}
+			joinedRoom, joined := sessions.roomFor(me)
+			if !joined || !sessions.validate(context.Background(), store, me, false, true) ||
+				!sessions.validate(context.Background(), store, targetID, false, true) {
+				utils.Log().Printf("Socket %v cannot follow user %v after ACL change\n", me, targetID)
+				sessions.release(me)
+				socket.Disconnect(true)
+				return
+			}
+			sessions.pruneUnauthorized(context.Background(), ioo, store, joinedRoom, true)
 
 			followRoom := socketio.Room(followRoomPrefix + string(targetID))
 			switch action {
@@ -454,7 +509,7 @@ func setupSocketIO() *socketio.Server {
 
 }
 
-func waitForShutdown(ioo *socketio.Server) {
+func waitForShutdown(server *http.Server, ioo *socketio.Server, mcStore *mcpcanvas.Store) {
 	exit := make(chan struct{})
 	SignalC := make(chan os.Signal, 1)
 
@@ -470,11 +525,17 @@ func waitForShutdown(ioo *socketio.Server) {
 	}()
 
 	<-exit
+	// 先关闭 Socket.IO，再停止接收 HTTP 请求并等待在途写入完成。
 	ioo.Close(nil)
-	os.Exit(0)
-	fmt.Println("Shutting down...")
-	// TODO(patwie): Close other resources
-	os.Exit(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		logrus.WithError(err).Warn("graceful HTTP shutdown timed out")
+	}
+	if err := mcStore.Close(); err != nil {
+		logrus.WithError(err).Warn("failed to close mcpcanvas database")
+	}
+	logrus.Info("Shutting down...")
 }
 
 func main() {
@@ -500,19 +561,20 @@ func main() {
 	openai.Init()
 	store := stores.GetStore()
 
-	r := setupRouter(store)
+	r, mcStore := setupRouter(store)
 
-	ioo := setupSocketIO()
+	ioo := setupSocketIO(store)
 	r.Mount("/socket.io/", ioo.ServeHandler(nil))
 	r.NotFound(handleNotFound())
 
 	logrus.WithField("addr", *listenAddress).Info("starting server")
+	server := &http.Server{Addr: *listenAddress, Handler: r}
 	go func() {
-		if err := http.ListenAndServe(*listenAddress, r); err != nil {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logrus.WithField("event", "start server").Fatal(err)
 		}
 	}()
 
 	logrus.Debug("Server is running in the background")
-	waitForShutdown(ioo)
+	waitForShutdown(server, ioo, mcStore)
 }

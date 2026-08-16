@@ -210,8 +210,8 @@ func (s *sqliteStore) commentSceneAccess(ctx context.Context, userID, sceneID st
 	return canWrite, nil
 }
 
-func (s *sqliteStore) requireSceneWrite(ctx context.Context, userID, sceneID string) error {
-	canWrite, err := s.commentSceneAccess(ctx, userID, sceneID)
+func requireSceneWriteWith(ctx context.Context, ex sqlExecutor, userID, sceneID string) error {
+	_, canWrite, err := sceneAccessWith(ctx, ex, userID, sceneID)
 	if err != nil {
 		return err
 	}
@@ -221,10 +221,19 @@ func (s *sqliteStore) requireSceneWrite(ctx context.Context, userID, sceneID str
 	return nil
 }
 
-// sceneOwner 返回场景所属用户（canvases.user_id）。
-func (s *sqliteStore) sceneOwner(ctx context.Context, sceneID string) (string, error) {
+// lockSceneForCommentWrite 先取得 SQLite 写锁，再在同一事务里重验 Scene ACL。
+// 这样 Scene/Collection 删除或成员移除不能插入到权限检查与评论写入之间。
+func lockSceneForCommentWrite(ctx context.Context, tx *sql.Tx, userID, sceneID string) error {
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE canvases SET updated_at = updated_at WHERE id = ?`, sceneID); err != nil {
+		return err
+	}
+	return requireSceneWriteWith(ctx, tx, userID, sceneID)
+}
+
+func sceneOwnerWith(ctx context.Context, ex sqlExecutor, sceneID string) (string, error) {
 	var owner string
-	err := s.db.QueryRowContext(ctx, `SELECT user_id FROM canvases WHERE id = ? LIMIT 1`, sceneID).Scan(&owner)
+	err := ex.QueryRowContext(ctx, `SELECT user_id FROM canvases WHERE id = ? LIMIT 1`, sceneID).Scan(&owner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", core.ErrNotFound
 	}
@@ -325,15 +334,34 @@ func (r *threadRow) toThread(profiles map[string]core.UserSummary) *core.Comment
 	return thread
 }
 
-// loadThreadRow 只读线程行，不做权限判断。
-func (s *sqliteStore) loadThreadRow(ctx context.Context, threadID string) (*threadRow, error) {
-	row := s.db.QueryRowContext(ctx,
+// loadThreadRowWith 只读线程行，不做权限判断。
+func loadThreadRowWith(ctx context.Context, ex sqlExecutor, threadID string) (*threadRow, error) {
+	row := ex.QueryRowContext(ctx,
 		`SELECT `+commentThreadCols+` FROM comment_threads WHERE id = ?`, threadID)
 	r, err := scanThreadRow(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, core.ErrNotFound
 	}
 	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+func (s *sqliteStore) loadThreadRow(ctx context.Context, threadID string) (*threadRow, error) {
+	return loadThreadRowWith(ctx, s.db, threadID)
+}
+
+func lockThreadForCommentWrite(ctx context.Context, tx *sql.Tx, userID, threadID string) (*threadRow, error) {
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE comment_threads SET updated_at = updated_at WHERE id = ?`, threadID); err != nil {
+		return nil, err
+	}
+	r, err := loadThreadRowWith(ctx, tx, threadID)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireSceneWriteWith(ctx, tx, userID, r.sceneID); err != nil {
 		return nil, err
 	}
 	return r, nil
@@ -486,9 +514,6 @@ func (s *sqliteStore) CreateThread(ctx context.Context, userID, sceneID string, 
 	if content == "" {
 		return nil, core.ErrInvalidInput
 	}
-	if err := s.requireSceneWrite(ctx, userID, sceneID); err != nil {
-		return nil, err
-	}
 
 	now := time.Now().UTC()
 	threadID := ulid.Make().String()
@@ -499,6 +524,9 @@ func (s *sqliteStore) CreateThread(ctx context.Context, userID, sceneID string, 
 		return nil, err
 	}
 	defer tx.Rollback()
+	if err := lockSceneForCommentWrite(ctx, tx, userID, sceneID); err != nil {
+		return nil, err
+	}
 
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO comment_threads (id, scene_id, x, y, resolved, created_by, created_at, updated_at)
@@ -530,15 +558,16 @@ func (s *sqliteStore) CreateThread(ctx context.Context, userID, sceneID string, 
 }
 
 func (s *sqliteStore) UpdateThreadPosition(ctx context.Context, userID, threadID string, x, y *float64) (*core.CommentThread, error) {
-	r, err := s.loadThreadRow(ctx, threadID)
+	if x == nil && y == nil {
+		return s.GetThread(ctx, userID, threadID)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSceneWrite(ctx, userID, r.sceneID); err != nil {
+	defer tx.Rollback()
+	if _, err := lockThreadForCommentWrite(ctx, tx, userID, threadID); err != nil {
 		return nil, err
-	}
-	if x == nil && y == nil {
-		return s.GetThread(ctx, userID, threadID)
 	}
 
 	sets := []string{"updated_at = ?"}
@@ -553,49 +582,58 @@ func (s *sqliteStore) UpdateThreadPosition(ctx context.Context, userID, threadID
 	}
 	args = append(args, threadID)
 
-	if _, err := s.db.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE comment_threads SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return s.GetThread(ctx, userID, threadID)
 }
 
 func (s *sqliteStore) SetThreadResolved(ctx context.Context, userID, threadID string, resolved bool) (*core.CommentThread, error) {
-	r, err := s.loadThreadRow(ctx, threadID)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireSceneWrite(ctx, userID, r.sceneID); err != nil {
+	defer tx.Rollback()
+	if _, err := lockThreadForCommentWrite(ctx, tx, userID, threadID); err != nil {
 		return nil, err
 	}
 
 	now := time.Now().UTC()
 	if resolved {
-		_, err = s.db.ExecContext(ctx,
+		_, err = tx.ExecContext(ctx,
 			`UPDATE comment_threads SET resolved = 1, resolved_at = ?, resolved_by = ?, updated_at = ? WHERE id = ?`,
 			now, userID, now, threadID)
 	} else {
-		_, err = s.db.ExecContext(ctx,
+		_, err = tx.ExecContext(ctx,
 			`UPDATE comment_threads SET resolved = 0, resolved_at = NULL, resolved_by = NULL, updated_at = ? WHERE id = ?`,
 			now, threadID)
 	}
 	if err != nil {
 		return nil, err
 	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 	return s.GetThread(ctx, userID, threadID)
 }
 
 func (s *sqliteStore) DeleteThread(ctx context.Context, userID, threadID string) error {
-	r, err := s.loadThreadRow(ctx, threadID)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if err := s.requireSceneWrite(ctx, userID, r.sceneID); err != nil {
+	defer tx.Rollback()
+	r, err := lockThreadForCommentWrite(ctx, tx, userID, threadID)
+	if err != nil {
 		return err
 	}
 	// 线程作者或场景所有者可删整条线程
 	if r.createdBy != userID {
-		owner, err := s.sceneOwner(ctx, r.sceneID)
+		owner, err := sceneOwnerWith(ctx, tx, r.sceneID)
 		if err != nil {
 			return err
 		}
@@ -603,12 +641,6 @@ func (s *sqliteStore) DeleteThread(ctx context.Context, userID, threadID string)
 			return core.ErrForbidden
 		}
 	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM comments WHERE thread_id = ?`, threadID); err != nil {
 		return err
@@ -631,13 +663,6 @@ func (s *sqliteStore) AddComment(ctx context.Context, userID, threadID, content 
 	if content == "" {
 		return nil, core.ErrInvalidInput
 	}
-	r, err := s.loadThreadRow(ctx, threadID)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.requireSceneWrite(ctx, userID, r.sceneID); err != nil {
-		return nil, err
-	}
 
 	now := time.Now().UTC()
 	commentID := ulid.Make().String()
@@ -647,6 +672,10 @@ func (s *sqliteStore) AddComment(ctx context.Context, userID, threadID, content 
 		return nil, err
 	}
 	defer tx.Rollback()
+	r, err := lockThreadForCommentWrite(ctx, tx, userID, threadID)
+	if err != nil {
+		return nil, err
+	}
 
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO comments (id, thread_id, content, mentions, created_by, created_at)
@@ -687,13 +716,23 @@ func (s *sqliteStore) UpdateComment(ctx context.Context, userID, commentID, cont
 		return nil, core.ErrInvalidInput
 	}
 
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE comments SET edited_at = edited_at WHERE id = ?`, commentID); err != nil {
+		return nil, err
+	}
+
 	var (
 		threadID  string
 		author    string
 		mentions  sql.NullString
 		createdAt sql.NullTime
 	)
-	err := s.db.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`SELECT thread_id, created_by, mentions, created_at FROM comments WHERE id = ?`, commentID).
 		Scan(&threadID, &author, &mentions, &createdAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -706,21 +745,20 @@ func (s *sqliteStore) UpdateComment(ctx context.Context, userID, commentID, cont
 		return nil, core.ErrForbidden
 	}
 
-	r, err := s.loadThreadRow(ctx, threadID)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.requireSceneWrite(ctx, userID, r.sceneID); err != nil {
+	if _, err := lockThreadForCommentWrite(ctx, tx, userID, threadID); err != nil {
 		return nil, err
 	}
 
 	now := time.Now().UTC()
-	if _, err := s.db.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE comments SET content = ?, edited_at = ? WHERE id = ?`, content, now, commentID); err != nil {
 		return nil, err
 	}
-	if _, err := s.db.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE comment_threads SET updated_at = ? WHERE id = ?`, now, threadID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 
@@ -738,8 +776,18 @@ func (s *sqliteStore) UpdateComment(ctx context.Context, userID, commentID, cont
 
 // DeleteComment 删除单条评论；若该线程已无评论，连线程一起删除（避免留下空图钉）。
 func (s *sqliteStore) DeleteComment(ctx context.Context, userID, commentID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE comments SET edited_at = edited_at WHERE id = ?`, commentID); err != nil {
+		return err
+	}
+
 	var threadID, author string
-	err := s.db.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`SELECT thread_id, created_by FROM comments WHERE id = ?`, commentID).Scan(&threadID, &author)
 	if errors.Is(err, sql.ErrNoRows) {
 		return core.ErrNotFound
@@ -748,15 +796,12 @@ func (s *sqliteStore) DeleteComment(ctx context.Context, userID, commentID strin
 		return err
 	}
 
-	r, err := s.loadThreadRow(ctx, threadID)
+	r, err := lockThreadForCommentWrite(ctx, tx, userID, threadID)
 	if err != nil {
 		return err
 	}
-	if err := s.requireSceneWrite(ctx, userID, r.sceneID); err != nil {
-		return err
-	}
 	if author != userID {
-		owner, err := s.sceneOwner(ctx, r.sceneID)
+		owner, err := sceneOwnerWith(ctx, tx, r.sceneID)
 		if err != nil {
 			return err
 		}
@@ -764,12 +809,6 @@ func (s *sqliteStore) DeleteComment(ctx context.Context, userID, commentID strin
 			return core.ErrForbidden
 		}
 	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 
 	if _, err := tx.ExecContext(ctx, `DELETE FROM comments WHERE id = ?`, commentID); err != nil {
 		return err
@@ -840,7 +879,12 @@ func (s *sqliteStore) notifyForComment(ctx context.Context, p notifyParams) {
 }
 
 const notificationCols = `n.id, n.type, n.scene_id, n.thread_id, n.comment_id, n.actor_user_id, n.read_at, n.created_at,
-	(SELECT c.name FROM canvases c WHERE c.id = n.scene_id LIMIT 1)`
+	cv.name`
+
+const notificationAccessJoin = `
+	JOIN canvases cv ON cv.id = n.scene_id
+	JOIN shell_collections sc ON sc.id = cv.collection_id
+	JOIN shell_members sm ON sm.workspace_id = sc.workspace_id AND sm.user_id = ?`
 
 func (s *sqliteStore) ListNotifications(ctx context.Context, userID, cursor string, limit int, unreadOnly bool) (*core.NotificationsResponse, error) {
 	if limit <= 0 {
@@ -850,8 +894,10 @@ func (s *sqliteStore) ListNotifications(ctx context.Context, userID, cursor stri
 		limit = 100
 	}
 
-	query := `SELECT ` + notificationCols + ` FROM notifications n WHERE n.user_id = ?`
-	args := []any{userID}
+	// 通知不能成为已删除 Scene 或已退出 Workspace 的旁路。历史库可能已经
+	// 留下孤儿通知，因此读取时也必须按当前 Scene/Collection/Workspace ACL 过滤。
+	query := `SELECT ` + notificationCols + ` FROM notifications n` + notificationAccessJoin + ` WHERE n.user_id = ?`
+	args := []any{userID, userID}
 	if unreadOnly {
 		query += ` AND n.read_at IS NULL`
 	}
@@ -939,7 +985,8 @@ func (s *sqliteStore) ListNotifications(ctx context.Context, userID, cursor stri
 func (s *sqliteStore) CountUnreadNotifications(ctx context.Context, userID string) (int, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM notifications WHERE user_id = ? AND read_at IS NULL`, userID).Scan(&count)
+		`SELECT COUNT(*) FROM notifications n`+notificationAccessJoin+`
+		 WHERE n.user_id = ? AND n.read_at IS NULL`, userID, userID).Scan(&count)
 	return count, err
 }
 

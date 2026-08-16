@@ -7,6 +7,7 @@ import (
 	"excalidraw-complete/core"
 	"path/filepath"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -190,6 +191,114 @@ func TestCommentPermissions(t *testing.T) {
 	}
 }
 
+func TestCommentWritesDoNotRecreateDependentsAfterSceneDeletion(t *testing.T) {
+	t.Run("创建线程", func(t *testing.T) {
+		store := newShellStore(t)
+		ctx := context.Background()
+		const userID = "user-alice"
+		sceneID := newSceneForComments(t, store, userID, "Alice")
+
+		deleteTx, err := store.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := deleteTx.ExecContext(ctx, `DELETE FROM canvases WHERE id = ?`, sceneID); err != nil {
+			t.Fatal(err)
+		}
+
+		result := make(chan error, 1)
+		go func() {
+			_, err := store.CreateThread(ctx, userID, sceneID, 0, 0, "并发评论", nil)
+			result <- err
+		}()
+		select {
+		case err := <-result:
+			t.Fatalf("Scene 删除事务提交前评论写入不应完成: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		if err := deleteTx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-result:
+			if !errors.Is(err, core.ErrNotFound) {
+				t.Fatalf("删除提交后的 CreateThread 错误 = %v，期望 ErrNotFound", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("CreateThread 未在删除事务提交后结束")
+		}
+
+		var count int
+		if err := store.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM comment_threads WHERE scene_id = ?`, sceneID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("已删除 Scene 留下 %d 条孤儿线程", count)
+		}
+	})
+
+	t.Run("新增回复", func(t *testing.T) {
+		store := newShellStore(t)
+		ctx := context.Background()
+		const userID = "user-alice"
+		sceneID := newSceneForComments(t, store, userID, "Alice")
+		thread, err := store.CreateThread(ctx, userID, sceneID, 0, 0, "根评论", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		deleteTx, err := store.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, statement := range []string{
+			`DELETE FROM comments WHERE thread_id = ?`,
+			`DELETE FROM comment_threads WHERE id = ?`,
+			`DELETE FROM canvases WHERE id = ?`,
+		} {
+			arg := thread.ID
+			if statement == `DELETE FROM canvases WHERE id = ?` {
+				arg = sceneID
+			}
+			if _, err := deleteTx.ExecContext(ctx, statement, arg); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		result := make(chan error, 1)
+		go func() {
+			_, err := store.AddComment(ctx, userID, thread.ID, "并发回复", nil)
+			result <- err
+		}()
+		select {
+		case err := <-result:
+			t.Fatalf("Scene 删除事务提交前回复写入不应完成: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		if err := deleteTx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-result:
+			if !errors.Is(err, core.ErrNotFound) {
+				t.Fatalf("删除提交后的 AddComment 错误 = %v，期望 ErrNotFound", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("AddComment 未在删除事务提交后结束")
+		}
+
+		var count int
+		if err := store.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM comments WHERE thread_id = ?`, thread.ID).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("已删除线程留下 %d 条孤儿回复", count)
+		}
+	})
+}
+
 // TestMentionNotifications 校验 @提及写 MENTION、被回复的线程作者写 COMMENT，且不给自己发。
 func TestMentionNotifications(t *testing.T) {
 	store := newShellStore(t)
@@ -282,6 +391,60 @@ func TestMentionNotifications(t *testing.T) {
 	} else if count != 0 {
 		t.Fatalf("全部已读后未读数 = %d，期望 0", count)
 	}
+}
+
+func TestNotificationsHideDeletedOrInaccessibleScenes(t *testing.T) {
+	store := newShellStore(t)
+	ctx := context.Background()
+	const owner = "user-alice"
+
+	sceneID := newSceneForComments(t, store, owner, "Alice")
+	workspaceID := workspaceIDOfScene(t, store, sceneID)
+	bob := core.MemberUser{ID: "user-bob", Email: "bob@example.com"}
+	if err := store.UpsertUserProfile(ctx, bob); err != nil {
+		t.Fatal(err)
+	}
+	member, err := store.InviteMember(ctx, owner, workspaceID, bob.Email, core.RoleMember)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateThread(ctx, owner, sceneID, 0, 0, "@[Bob](user-bob)", []string{bob.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	assertHidden := func(reason string) {
+		t.Helper()
+		resp, err := store.ListNotifications(ctx, bob.ID, "", 20, false)
+		if err != nil {
+			t.Fatalf("%s: ListNotifications() 错误 = %v", reason, err)
+		}
+		if len(resp.Notifications) != 0 {
+			t.Fatalf("%s: 仍返回通知 = %+v", reason, resp.Notifications)
+		}
+		count, err := store.CountUnreadNotifications(ctx, bob.ID)
+		if err != nil {
+			t.Fatalf("%s: CountUnreadNotifications() 错误 = %v", reason, err)
+		}
+		if count != 0 {
+			t.Fatalf("%s: 未读数 = %d，期望 0", reason, count)
+		}
+	}
+
+	if _, err := store.db.ExecContext(ctx,
+		`DELETE FROM shell_members WHERE id = ?`, member.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertHidden("成员已退出 Workspace")
+
+	if _, err := store.db.ExecContext(ctx,
+		`INSERT INTO shell_members (id, workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?, ?)`,
+		"member-bob-restored", workspaceID, bob.ID, string(core.RoleMember), time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, `DELETE FROM canvases WHERE id = ?`, sceneID); err != nil {
+		t.Fatal(err)
+	}
+	assertHidden("历史孤儿通知指向已删除 Scene")
 }
 
 func boolPtr(v bool) *bool {

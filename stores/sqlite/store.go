@@ -129,6 +129,9 @@ CREATE TABLE IF NOT EXISTS workspaces (
 	if err = store.MigrateLegacyGroupsToShell(context.Background()); err != nil {
 		log.Fatalf("failed to migrate legacy groups to workspace shell: %v", err)
 	}
+	if err = store.RepairSceneOwnership(context.Background()); err != nil {
+		log.Fatalf("failed to repair scene ownership: %v", err)
+	}
 
 	return store
 }
@@ -236,47 +239,29 @@ func (s *sqliteStore) Get(ctx context.Context, userID, id string) (*core.Canvas,
 }
 
 func (s *sqliteStore) Save(ctx context.Context, canvas *core.Canvas) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback() // Rollback on any error
-
-	// 画布未指定分组时默认归入 default
-	if canvas.WorkspaceID == "" {
-		canvas.WorkspaceID = core.DefaultWorkspaceID
-	}
-
 	now := time.Now()
 	r, canEdit, accessErr := s.sceneAccess(ctx, canvas.UserID, canvas.ID)
 	if accessErr == nil {
 		if !canEdit {
 			return core.ErrForbidden
 		}
-		if err := s.rejectIfExclusiveLockHeld(ctx, canvas.UserID, canvas.ID); err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx, "UPDATE canvases SET name = ?, data = ?, updated_at = ?, thumbnail = ?, workspace_id = ? WHERE user_id = ? AND id = ?", canvas.Name, canvas.Data, now, canvas.Thumbnail, canvas.WorkspaceID, r.ownerID, r.id)
+		// 现有 Scene 的 Workspace 只能由其 Collection 决定。旧 KV 请求体中的
+		// workspaceId 不能拆开更新冗余字段，否则会制造跨 Workspace 脏数据。
+		return s.execSceneContentWrite(ctx, canvas.UserID, r.ownerID, r.id,
+			`name = ?, data = ?, updated_at = ?, thumbnail = ?,
+			 workspace_id = COALESCE((SELECT workspace_id FROM shell_collections WHERE id = canvases.collection_id), canvases.workspace_id)`,
+			canvas.Name, canvas.Data, now, canvas.Thumbnail)
 	} else if errors.Is(accessErr, core.ErrNotFound) {
-		// 禁止把浏览器 IndexedDB UUID 插入 SQLite，否则 Workspace 会混入本地脏数据。
-		if isIndexedDBCanvasID(canvas.ID) {
-			return fmt.Errorf("refusing to persist indexeddb canvas id")
-		}
-		_, err = tx.ExecContext(ctx, "INSERT INTO canvases (id, user_id, name, data, created_at, updated_at, thumbnail, workspace_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", canvas.ID, canvas.UserID, canvas.Name, canvas.Data, now, now, canvas.Thumbnail, canvas.WorkspaceID)
+		// Scene 创建只能走 CreateScene，使 Collection/Workspace 归属在同一事务内
+		// 建立。旧 KV PUT 不再承担 upsert，避免绕过正式创建与锁协议。
+		return core.ErrNotFound
 	} else {
 		return accessErr
 	}
-
-	if err != nil {
-		return err
-	}
-
-	return tx.Commit()
 }
 
 func (s *sqliteStore) Delete(ctx context.Context, userID, id string) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM canvases WHERE user_id = ? AND id = ?", userID, id)
-	return err
+	return s.DeleteScene(ctx, userID, id)
 }
 
 // WorkspaceStore implementation
@@ -378,25 +363,9 @@ func (s *sqliteStore) DeleteWorkspace(ctx context.Context, userID, id string) er
 }
 
 func (s *sqliteStore) MoveCanvasWorkspace(ctx context.Context, userID, canvasID, workspaceID string) error {
-	// 目标分组必须存在（default 恒存在）
-	var exists int
-	if err := s.db.QueryRowContext(ctx, "SELECT 1 FROM workspaces WHERE id = ? AND user_id = ?", workspaceID, userID).Scan(&exists); err != nil {
-		if err == sql.ErrNoRows {
-			return fmt.Errorf("workspace not found")
-		}
-		return err
-	}
-
-	res, err := s.db.ExecContext(ctx, `UPDATE canvases SET workspace_id = ? WHERE user_id = ? AND id = ?`, workspaceID, userID, canvasID)
-	if err != nil {
-		return err
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 0 {
-		return fmt.Errorf("canvas not found")
-	}
-	return nil
+	_ = ctx
+	_ = userID
+	_ = canvasID
+	_ = workspaceID
+	return fmt.Errorf("legacy canvas workspace move is disabled; move the Scene to a Collection: %w", core.ErrInvalidInput)
 }

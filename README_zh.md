@@ -98,7 +98,7 @@ sed -i "s|ADMIN_PASSWORD_HASH=.*|ADMIN_PASSWORD_HASH='$(cat .htpasswd)'|" .env
 
 这会配置服务器的内置存储，默认使用。
 
-- `STORAGE_TYPE`: `memory` (默认), `sqlite`, `filesystem`, 或 `s3`。
+- `STORAGE_TYPE`: Workspace Shell 服务必须使用 `sqlite`（未设置时也默认使用 SQLite）。
 - `DATA_SOURCE_NAME`: SQLite 数据库的路径 (例如, `excalidraw.db`)。
 - `LOCAL_STORAGE_PATH`: 文件系统存储的目录。
 - `S3_BUCKET_NAME`, `AWS_REGION`, 等: 用于 S3 存储。
@@ -165,8 +165,7 @@ docker run -p 3002:3002 \
 
 ### 手动构建
 
-1.  **构建前端**: 按照原始 README 中的步骤，在 `excalidraw/` 子模块内打补丁并构建 Excalidraw 前端。
-2.  **复制前端**: 确保将 `excalidraw/excalidraw-app/build` 中构建好的前端文件复制到根目录的 `frontend/` 目录下。
+1.  **构建嵌入式前端**: 运行 `./scripts/build-embedded-frontend.sh`。脚本会构建 `excalidraw/` 子模块，先暂存产物，构建成功后才替换 `frontend/`；会排除 sourcemap，因为 Go 会嵌入该目录中的全部文件。
 3.  **构建 Go 后端**:
     ```bash
     go build -o excalidraw-complete main.go
@@ -178,4 +177,4 @@ docker run -p 3002:3002 \
     ```
 ---
 
-Excalidraw 是一个很棒的工具。该项目旨在让每个人都能使用一个功能强大、数据安全的版本。欢迎贡献！ 
+Excalidraw 是一个很棒的工具。该项目旨在让每个人都能使用一个功能强大、数据安全的版本。欢迎贡献！

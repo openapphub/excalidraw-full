@@ -41,3 +41,23 @@ func AuthJWT(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
+
+// AuthWebSocketJWT 从 WebSocket 子协议读取 JWT。浏览器 WebSocket API 不能
+// 自定义 Authorization 头；把 token 放在查询串又会泄露到访问日志，因此使用
+// `Sec-WebSocket-Protocol: excalidraw-auth, <jwt>`。
+func AuthWebSocketJWT(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		protocols := strings.Split(r.Header.Get("Sec-WebSocket-Protocol"), ",")
+		if len(protocols) < 2 || strings.TrimSpace(protocols[0]) != "excalidraw-auth" {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		claims, err := auth.ParseJWT(strings.TrimSpace(protocols[1]))
+		if err != nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		ctx := context.WithValue(r.Context(), ClaimsContextKey, claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}

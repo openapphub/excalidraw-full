@@ -2,6 +2,7 @@ package kv
 
 import (
 	"encoding/json"
+	"errors"
 	"excalidraw-complete/core"
 	"excalidraw-complete/handlers/auth"
 	"excalidraw-complete/middleware"
@@ -247,6 +248,11 @@ func HandleMoveCanvasWorkspace(store stores.Store) http.HandlerFunc {
 				"key":         key,
 				"workspaceID": req.WorkspaceID,
 			}).Error("Failed to move canvas workspace")
+			if errors.Is(err, core.ErrInvalidInput) {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, map[string]string{"error": err.Error()})
+				return
+			}
 			render.Status(r, http.StatusNotFound)
 			render.JSON(w, r, map[string]string{"error": "Canvas or workspace not found"})
 			return

@@ -31,31 +31,64 @@ func (s *Store) handleSnapshotSave(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "snapshot name is required")
 		return
 	}
+	canvasID := r.URL.Query().Get("canvasId")
+	if canvasID == "" {
+		writeErr(w, http.StatusBadRequest, "canvasId query param is required")
+		return
+	}
+	if err := s.authorizeCanvas(r, canvasID, true); err != nil {
+		writeAccessErr(w, err)
+		return
+	}
 	s.mu.RLock()
-	all := s.getAll()
+	_, exists := s.targets[canvasID]
+	all := s.getAll(canvasID)
+	// 深拷贝，锁外安全序列化（避免并发 map 读写 panic）
+	all = cloneElementsForRead(all)
 	s.mu.RUnlock()
+	if !exists {
+		writeErr(w, http.StatusNotFound, "Canvas "+canvasID+" not found")
+		return
+	}
 	data, err := json.Marshal(all)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to marshal canvas")
 		return
 	}
 	createdAt := time.Now().Format(time.RFC3339)
-	if _, err := s.db.Exec(`INSERT INTO mcp_snapshots (name, elements, created_at) VALUES (?, ?, ?)
-		ON CONFLICT(name) DO UPDATE SET elements = excluded.elements, created_at = excluded.created_at`,
-		body.Name, data, createdAt); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO mcp_canvas_snapshots (canvas_id, name, elements, created_at) VALUES (?, ?, ?, ?)
+		ON CONFLICT(canvas_id, name) DO UPDATE SET elements = excluded.elements, created_at = excluded.created_at`,
+		canvasID, body.Name, data, createdAt); err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to save snapshot: "+err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"success":     true,
-		"name":        body.Name,
+		"success":      true,
+		"name":         body.Name,
+		"canvasId":     canvasID,
 		"elementCount": len(all),
-		"createdAt":   createdAt,
+		"createdAt":    createdAt,
 	})
 }
 
 func (s *Store) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(`SELECT name, elements, created_at FROM mcp_snapshots ORDER BY created_at DESC`)
+	canvasID := r.URL.Query().Get("canvasId")
+	if canvasID == "" {
+		writeErr(w, http.StatusBadRequest, "canvasId query param is required")
+		return
+	}
+	if err := s.authorizeCanvas(r, canvasID, false); err != nil {
+		writeAccessErr(w, err)
+		return
+	}
+	s.mu.RLock()
+	_, exists := s.targets[canvasID]
+	s.mu.RUnlock()
+	if !exists {
+		writeErr(w, http.StatusNotFound, "Canvas "+canvasID+" not found")
+		return
+	}
+	rows, err := s.db.Query(`SELECT name, elements, created_at FROM mcp_canvas_snapshots WHERE canvas_id = ? ORDER BY created_at DESC`, canvasID)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to list snapshots: "+err.Error())
 		return
@@ -78,14 +111,23 @@ func (s *Store) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
 		_ = json.Unmarshal(data, &elems)
 		snaps = append(snaps, snapMeta{Name: name, Count: len(elems), CreatedAt: createdAt})
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "snapshots": snaps, "count": len(snaps)})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "canvasId": canvasID, "snapshots": snaps, "count": len(snaps)})
 }
 
 func (s *Store) handleSnapshotGet(w http.ResponseWriter, r *http.Request) {
+	canvasID := r.URL.Query().Get("canvasId")
+	if canvasID == "" {
+		writeErr(w, http.StatusBadRequest, "canvasId query param is required")
+		return
+	}
+	if err := s.authorizeCanvas(r, canvasID, false); err != nil {
+		writeAccessErr(w, err)
+		return
+	}
 	name := chi.URLParam(r, "name")
 	var data []byte
 	var createdAt string
-	err := s.db.QueryRow(`SELECT elements, created_at FROM mcp_snapshots WHERE name = ?`, name).Scan(&data, &createdAt)
+	err := s.db.QueryRow(`SELECT elements, created_at FROM mcp_canvas_snapshots WHERE canvas_id = ? AND name = ?`, canvasID, name).Scan(&data, &createdAt)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "Snapshot \""+name+"\" not found")
 		return
@@ -96,7 +138,8 @@ func (s *Store) handleSnapshotGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
+		"success":  true,
+		"canvasId": canvasID,
 		"snapshot": map[string]interface{}{
 			"name":      name,
 			"elements":  elems,

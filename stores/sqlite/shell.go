@@ -66,8 +66,22 @@ var shellSchemaStmts = []string{
 	expires_at DATETIME,
 	max_uses INTEGER,
 	uses INTEGER NOT NULL DEFAULT 0,
-	created_at DATETIME
-);`,
+		created_at DATETIME
+	);`,
+	`CREATE TABLE IF NOT EXISTS mcp_canvas_targets (
+		canvas_id TEXT PRIMARY KEY,
+		owner_user_id TEXT NOT NULL,
+		workspace_id TEXT NOT NULL,
+		collection_id TEXT NOT NULL,
+		created_at DATETIME NOT NULL
+	);`,
+	`CREATE TABLE IF NOT EXISTS mcp_canvas_snapshots (
+		canvas_id TEXT NOT NULL,
+		name TEXT NOT NULL,
+		elements BLOB NOT NULL,
+		created_at DATETIME NOT NULL,
+		PRIMARY KEY (canvas_id, name)
+	);`,
 	// 迁移标记：老分组 → 集合的迁移按用户粒度只跑一次
 	`CREATE TABLE IF NOT EXISTS shell_migrated_users (
 	user_id TEXT PRIMARY KEY,
@@ -95,6 +109,11 @@ func ensureShellSchema(db *sql.DB) {
 
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_canvases_collection ON canvases(collection_id)`); err != nil {
 		log.Fatalf("failed to create canvases collection index: %v", err)
+	}
+	// canvases.id 单列索引：sceneAccess/GetSceneData/评论/编辑锁等热路径
+	// 用 `WHERE id = ?` 不带 user_id，无法利用 (user_id, id) 复合主键前缀，否则全表扫描。
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_canvases_id ON canvases(id)`); err != nil {
+		log.Fatalf("failed to create canvases id index: %v", err)
 	}
 }
 
@@ -150,6 +169,78 @@ func ntPtr(nt sql.NullTime) *time.Time {
 	}
 	v := nt.Time
 	return &v
+}
+
+func deleteSceneDependents(ctx context.Context, ex sqlExecutor, sceneID string) error {
+	for _, stmt := range []string{
+		`DELETE FROM notifications WHERE scene_id = ? OR thread_id IN (SELECT id FROM comment_threads WHERE scene_id = ?)`,
+		`DELETE FROM comments WHERE thread_id IN (SELECT id FROM comment_threads WHERE scene_id = ?)`,
+		`DELETE FROM comment_threads WHERE scene_id = ?`,
+		`DELETE FROM mcp_canvas_snapshots WHERE canvas_id = ?`,
+		`DELETE FROM mcp_canvas_targets WHERE canvas_id = ?`,
+	} {
+		args := []any{sceneID}
+		if strings.Count(stmt, "?") == 2 {
+			args = append(args, sceneID)
+		}
+		if _, err := ex.ExecContext(ctx, stmt, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func deleteSceneDependentsByCollection(ctx context.Context, ex sqlExecutor, collectionID string) error {
+	for _, stmt := range []string{
+		`DELETE FROM notifications WHERE scene_id IN (SELECT id FROM canvases WHERE collection_id = ?)
+		 OR thread_id IN (SELECT id FROM comment_threads WHERE scene_id IN (SELECT id FROM canvases WHERE collection_id = ?))`,
+		`DELETE FROM comments WHERE thread_id IN (SELECT id FROM comment_threads WHERE scene_id IN (SELECT id FROM canvases WHERE collection_id = ?))`,
+		`DELETE FROM comment_threads WHERE scene_id IN (SELECT id FROM canvases WHERE collection_id = ?)`,
+		`DELETE FROM mcp_canvas_snapshots WHERE canvas_id IN (SELECT id FROM canvases WHERE collection_id = ?)`,
+		`DELETE FROM mcp_canvas_targets WHERE collection_id = ? OR canvas_id IN (SELECT id FROM canvases WHERE collection_id = ?)`,
+	} {
+		args := []any{collectionID}
+		if strings.Count(stmt, "?") == 2 {
+			args = append(args, collectionID)
+		}
+		if _, err := ex.ExecContext(ctx, stmt, args...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func deleteSceneDependentsByWorkspace(ctx context.Context, ex sqlExecutor, workspaceID string) error {
+	for _, stmt := range []string{
+		`DELETE FROM notifications WHERE scene_id IN (
+			SELECT cv.id FROM canvases cv JOIN shell_collections c ON c.id = cv.collection_id WHERE c.workspace_id = ?
+		) OR thread_id IN (
+			SELECT ct.id FROM comment_threads ct JOIN canvases cv ON cv.id = ct.scene_id
+			JOIN shell_collections c ON c.id = cv.collection_id WHERE c.workspace_id = ?
+		)`,
+		`DELETE FROM comments WHERE thread_id IN (
+			SELECT ct.id FROM comment_threads ct JOIN canvases cv ON cv.id = ct.scene_id
+			JOIN shell_collections c ON c.id = cv.collection_id WHERE c.workspace_id = ?
+		)`,
+		`DELETE FROM comment_threads WHERE scene_id IN (
+			SELECT cv.id FROM canvases cv JOIN shell_collections c ON c.id = cv.collection_id WHERE c.workspace_id = ?
+		)`,
+		`DELETE FROM mcp_canvas_snapshots WHERE canvas_id IN (
+			SELECT cv.id FROM canvases cv JOIN shell_collections c ON c.id = cv.collection_id WHERE c.workspace_id = ?
+		)`,
+		`DELETE FROM mcp_canvas_targets WHERE workspace_id = ? OR collection_id IN (
+			SELECT id FROM shell_collections WHERE workspace_id = ?
+		)`,
+	} {
+		args := []any{workspaceID}
+		if strings.Count(stmt, "?") == 2 {
+			args = append(args, workspaceID)
+		}
+		if _, err := ex.ExecContext(ctx, stmt, args...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // slugify 生成 URL 安全片段。
@@ -213,8 +304,12 @@ func newInviteCode() (string, error) {
 
 // memberRole 返回用户在工作区中的角色，非成员返回 core.ErrForbidden。
 func (s *sqliteStore) memberRole(ctx context.Context, userID, workspaceID string) (core.WorkspaceRole, error) {
+	return memberRoleWith(ctx, s.db, userID, workspaceID)
+}
+
+func memberRoleWith(ctx context.Context, ex sqlExecutor, userID, workspaceID string) (core.WorkspaceRole, error) {
 	var role string
-	err := s.db.QueryRowContext(ctx,
+	err := ex.QueryRowContext(ctx,
 		`SELECT role FROM shell_members WHERE workspace_id = ? AND user_id = ?`, workspaceID, userID).Scan(&role)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", core.ErrForbidden
@@ -227,10 +322,14 @@ func (s *sqliteStore) memberRole(ctx context.Context, userID, workspaceID string
 
 // resolveRole 在非成员时区分“工作区不存在”与“无权限”。
 func (s *sqliteStore) resolveRole(ctx context.Context, userID, workspaceID string) (core.WorkspaceRole, error) {
-	role, err := s.memberRole(ctx, userID, workspaceID)
+	return resolveRoleWith(ctx, s.db, userID, workspaceID)
+}
+
+func resolveRoleWith(ctx context.Context, ex sqlExecutor, userID, workspaceID string) (core.WorkspaceRole, error) {
+	role, err := memberRoleWith(ctx, ex, userID, workspaceID)
 	if errors.Is(err, core.ErrForbidden) {
 		var one int
-		qerr := s.db.QueryRowContext(ctx, `SELECT 1 FROM shell_workspaces WHERE id = ?`, workspaceID).Scan(&one)
+		qerr := ex.QueryRowContext(ctx, `SELECT 1 FROM shell_workspaces WHERE id = ?`, workspaceID).Scan(&one)
 		if errors.Is(qerr, sql.ErrNoRows) {
 			return "", core.ErrNotFound
 		}
@@ -258,6 +357,15 @@ func requireAdmin(role core.WorkspaceRole) error {
 		return nil
 	}
 	return core.ErrForbidden
+}
+
+func validWorkspaceRole(role core.WorkspaceRole) bool {
+	switch role {
+	case core.RoleAdmin, core.RoleMember, core.RoleViewer:
+		return true
+	default:
+		return false
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -452,7 +560,15 @@ func (s *sqliteStore) CreateShellWorkspace(ctx context.Context, userID, name, sl
 }
 
 func (s *sqliteStore) UpdateShellWorkspace(ctx context.Context, userID, workspaceID string, name, slug *string) (*core.ShellWorkspace, error) {
-	role, err := s.resolveRole(ctx, userID, workspaceID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_workspaces SET updated_at = updated_at WHERE id = ?`, workspaceID); err != nil {
+		return nil, err
+	}
+	role, err := resolveRoleWith(ctx, tx, userID, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -460,44 +576,63 @@ func (s *sqliteStore) UpdateShellWorkspace(ctx context.Context, userID, workspac
 		return nil, err
 	}
 
+	sets := make([]string, 0, 3)
+	args := make([]any, 0, 4)
 	if name != nil && strings.TrimSpace(*name) != "" {
-		if _, err := s.db.ExecContext(ctx, `UPDATE shell_workspaces SET name = ?, updated_at = ? WHERE id = ?`,
-			strings.TrimSpace(*name), time.Now().UTC(), workspaceID); err != nil {
-			return nil, err
-		}
+		sets = append(sets, "name = ?")
+		args = append(args, strings.TrimSpace(*name))
 	}
 	if slug != nil && slugify(*slug) != "" {
 		desired := slugify(*slug)
 		var one int
-		err := s.db.QueryRowContext(ctx, `SELECT 1 FROM shell_workspaces WHERE slug = ? AND id <> ?`, desired, workspaceID).Scan(&one)
+		err := tx.QueryRowContext(ctx, `SELECT 1 FROM shell_workspaces WHERE slug = ? AND id <> ?`, desired, workspaceID).Scan(&one)
 		if err == nil {
 			return nil, core.ErrConflict
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
-		if _, err := s.db.ExecContext(ctx, `UPDATE shell_workspaces SET slug = ?, updated_at = ? WHERE id = ?`,
-			desired, time.Now().UTC(), workspaceID); err != nil {
+		sets = append(sets, "slug = ?")
+		args = append(args, desired)
+	}
+	if len(sets) > 0 {
+		sets = append(sets, "updated_at = ?")
+		args = append(args, time.Now().UTC(), workspaceID)
+		if _, err := tx.ExecContext(ctx, `UPDATE shell_workspaces SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
 			return nil, err
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 	return s.GetShellWorkspace(ctx, userID, workspaceID)
 }
 
 func (s *sqliteStore) UpdateShellWorkspaceAvatar(ctx context.Context, userID, workspaceID, avatarURL string) (*core.ShellWorkspace, error) {
-	role, err := s.resolveRole(ctx, userID, workspaceID)
+	if strings.TrimSpace(avatarURL) == "" {
+		return nil, core.ErrInvalidInput
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_workspaces SET updated_at = updated_at WHERE id = ?`, workspaceID); err != nil {
+		return nil, err
+	}
+	role, err := resolveRoleWith(ctx, tx, userID, workspaceID)
 	if err != nil {
 		return nil, err
 	}
 	if err := requireAdmin(role); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(avatarURL) == "" {
-		return nil, core.ErrInvalidInput
-	}
-	if _, err := s.db.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE shell_workspaces SET avatar_url = ?, updated_at = ? WHERE id = ?`,
 		avatarURL, time.Now().UTC(), workspaceID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return s.GetShellWorkspace(ctx, userID, workspaceID)
@@ -528,10 +663,56 @@ func (s *sqliteStore) DeleteShellWorkspace(ctx context.Context, userID, workspac
 		return err
 	}
 	defer tx.Rollback()
+	clientID := strings.TrimSpace(core.SceneClientIDFromContext(ctx))
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_workspaces SET updated_at = updated_at WHERE id = ?`, workspaceID); err != nil {
+		return err
+	}
+	role, err = resolveRoleWith(ctx, tx, userID, workspaceID)
+	if err != nil {
+		return err
+	}
+	if err := requireAdmin(role); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT type FROM shell_workspaces WHERE id = ?`, workspaceID).Scan(&typ); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return core.ErrNotFound
+		}
+		return err
+	}
+	if core.WorkspaceType(typ) == core.WorkspacePersonal {
+		return core.ErrDeletePersonal
+	}
+	var activeSceneID string
+	err = tx.QueryRowContext(ctx, `SELECT cv.id FROM canvases cv
+		JOIN shell_collections c ON c.id = cv.collection_id
+		WHERE c.workspace_id = ? AND (
+			cv.collab_enabled = 1 OR (
+				cv.edit_lock_user_id IS NOT NULL AND cv.edit_lock_until > ?
+				AND NOT (cv.edit_lock_user_id = ? AND cv.edit_lock_client_id = ?)
+			)
+		) LIMIT 1`, workspaceID, time.Now().UTC(), userID, clientID).Scan(&activeSceneID)
+	if err == nil {
+		st, stateErr := s.readCanvasEditState(ctx, tx, activeSceneID)
+		if stateErr != nil {
+			return stateErr
+		}
+		if st.collabEnabled {
+			return &core.SceneLockError{Message: "disable scene collaboration before deleting its workspace"}
+		}
+		return &core.SceneLockError{Editor: st.leaseEditor(userID)}
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 
-	// 场景本体保留（仍归属各自 owner），仅解除集合归属
+	// Workspace 删除必须让其 Collection 与 Scene 同时不可达，不能留下
+	// owner 仍可通过旧 URL 打开的孤儿 Scene。
+	if err := deleteSceneDependentsByWorkspace(ctx, tx, workspaceID); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE canvases SET collection_id = NULL WHERE collection_id IN (SELECT id FROM shell_collections WHERE workspace_id = ?)`,
+		`DELETE FROM canvases WHERE collection_id IN (SELECT id FROM shell_collections WHERE workspace_id = ?)`,
 		workspaceID); err != nil {
 		return err
 	}
@@ -601,7 +782,11 @@ func scanMember(sc rowScanner) (*core.WorkspaceMember, error) {
 }
 
 func (s *sqliteStore) getMember(ctx context.Context, workspaceID, memberID string) (*core.WorkspaceMember, error) {
-	row := s.db.QueryRowContext(ctx,
+	return getMemberWith(ctx, s.db, workspaceID, memberID)
+}
+
+func getMemberWith(ctx context.Context, ex sqlExecutor, workspaceID, memberID string) (*core.WorkspaceMember, error) {
+	row := ex.QueryRowContext(ctx,
 		`SELECT m.id, m.role, m.user_id, m.created_at, p.email, p.name, p.avatar_url
 		 FROM shell_members m
 		 LEFT JOIN user_profiles p ON p.id = m.user_id
@@ -614,22 +799,35 @@ func (s *sqliteStore) getMember(ctx context.Context, workspaceID, memberID strin
 }
 
 func (s *sqliteStore) InviteMember(ctx context.Context, actorID, workspaceID, email string, role core.WorkspaceRole) (*core.WorkspaceMember, error) {
-	actorRole, err := s.resolveRole(ctx, actorID, workspaceID)
-	if err != nil {
-		return nil, err
-	}
-	if err := requireAdmin(actorRole); err != nil {
-		return nil, err
-	}
 	if strings.TrimSpace(email) == "" {
 		return nil, core.ErrInvalidInput
 	}
 	if role == "" {
 		role = core.RoleMember
 	}
+	if !validWorkspaceRole(role) {
+		return nil, core.ErrInvalidInput
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	// 先取得 Workspace 写锁，再重验 ADMIN，避免权限撤销与成员写入穿插。
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_workspaces SET updated_at = updated_at WHERE id = ?`, workspaceID); err != nil {
+		return nil, err
+	}
+	actorRole, err := resolveRoleWith(ctx, tx, actorID, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireAdmin(actorRole); err != nil {
+		return nil, err
+	}
 
 	var targetID string
-	err = s.db.QueryRowContext(ctx, `SELECT id FROM user_profiles WHERE lower(email) = lower(?) LIMIT 1`,
+	err = tx.QueryRowContext(ctx, `SELECT id FROM user_profiles WHERE lower(email) = lower(?) LIMIT 1`,
 		strings.TrimSpace(email)).Scan(&targetID)
 	if errors.Is(err, sql.ErrNoRows) {
 		// 该邮箱尚未登录过本实例，handler 可提示改用邀请链接
@@ -640,7 +838,7 @@ func (s *sqliteStore) InviteMember(ctx context.Context, actorID, workspaceID, em
 	}
 
 	var one int
-	err = s.db.QueryRowContext(ctx, `SELECT 1 FROM shell_members WHERE workspace_id = ? AND user_id = ?`, workspaceID, targetID).Scan(&one)
+	err = tx.QueryRowContext(ctx, `SELECT 1 FROM shell_members WHERE workspace_id = ? AND user_id = ?`, workspaceID, targetID).Scan(&one)
 	if err == nil {
 		return nil, core.ErrConflict
 	}
@@ -649,33 +847,47 @@ func (s *sqliteStore) InviteMember(ctx context.Context, actorID, workspaceID, em
 	}
 
 	memberID := ulid.Make().String()
-	if _, err := s.db.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO shell_members (id, workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?, ?)`,
 		memberID, workspaceID, targetID, string(role), time.Now().UTC()); err != nil {
 		return nil, err
 	}
-	return s.getMember(ctx, workspaceID, memberID)
+	member, err := getMemberWith(ctx, tx, workspaceID, memberID)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return member, nil
 }
 
 func (s *sqliteStore) UpdateMemberRole(ctx context.Context, actorID, workspaceID, memberID string, role core.WorkspaceRole) (*core.WorkspaceMember, error) {
-	actorRole, err := s.resolveRole(ctx, actorID, workspaceID)
+	if !validWorkspaceRole(role) {
+		return nil, core.ErrInvalidInput
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_workspaces SET updated_at = updated_at WHERE id = ?`, workspaceID); err != nil {
+		return nil, err
+	}
+	actorRole, err := resolveRoleWith(ctx, tx, actorID, workspaceID)
 	if err != nil {
 		return nil, err
 	}
 	if err := requireAdmin(actorRole); err != nil {
 		return nil, err
 	}
-	switch role {
-	case core.RoleAdmin, core.RoleMember, core.RoleViewer:
-	default:
-		return nil, core.ErrInvalidInput
-	}
 
-	member, err := s.getMember(ctx, workspaceID, memberID)
+	member, err := getMemberWith(ctx, tx, workspaceID, memberID)
 	if err != nil {
 		return nil, err
 	}
-	owner, err := s.workspaceOwner(ctx, workspaceID)
+	owner, err := workspaceOwnerWith(ctx, tx, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -683,18 +895,33 @@ func (s *sqliteStore) UpdateMemberRole(ctx context.Context, actorID, workspaceID
 		return nil, core.ErrForbidden
 	}
 
-	if _, err := s.db.ExecContext(ctx, `UPDATE shell_members SET role = ? WHERE id = ?`, string(role), member.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_members SET role = ? WHERE id = ? AND workspace_id = ?`, string(role), member.ID, workspaceID); err != nil {
 		return nil, err
 	}
-	return s.getMember(ctx, workspaceID, member.ID)
+	updated, err := getMemberWith(ctx, tx, workspaceID, member.ID)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return updated, nil
 }
 
 func (s *sqliteStore) RemoveMember(ctx context.Context, actorID, workspaceID, memberID string) error {
-	actorRole, err := s.resolveRole(ctx, actorID, workspaceID)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	member, err := s.getMember(ctx, workspaceID, memberID)
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_workspaces SET updated_at = updated_at WHERE id = ?`, workspaceID); err != nil {
+		return err
+	}
+	actorRole, err := resolveRoleWith(ctx, tx, actorID, workspaceID)
+	if err != nil {
+		return err
+	}
+	member, err := getMemberWith(ctx, tx, workspaceID, memberID)
 	if err != nil {
 		return err
 	}
@@ -704,20 +931,26 @@ func (s *sqliteStore) RemoveMember(ctx context.Context, actorID, workspaceID, me
 			return err
 		}
 	}
-	owner, err := s.workspaceOwner(ctx, workspaceID)
+	owner, err := workspaceOwnerWith(ctx, tx, workspaceID)
 	if err != nil {
 		return err
 	}
 	if member.UserID == owner {
 		return core.ErrForbidden
 	}
-	_, err = s.db.ExecContext(ctx, `DELETE FROM shell_members WHERE id = ?`, member.ID)
-	return err
+	if _, err = tx.ExecContext(ctx, `DELETE FROM shell_members WHERE id = ? AND workspace_id = ?`, member.ID, workspaceID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *sqliteStore) workspaceOwner(ctx context.Context, workspaceID string) (string, error) {
+	return workspaceOwnerWith(ctx, s.db, workspaceID)
+}
+
+func workspaceOwnerWith(ctx context.Context, ex sqlExecutor, workspaceID string) (string, error) {
 	var owner string
-	err := s.db.QueryRowContext(ctx, `SELECT owner_user_id FROM shell_workspaces WHERE id = ?`, workspaceID).Scan(&owner)
+	err := ex.QueryRowContext(ctx, `SELECT owner_user_id FROM shell_workspaces WHERE id = ?`, workspaceID).Scan(&owner)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", core.ErrNotFound
 	}
@@ -779,15 +1012,11 @@ func (s *sqliteStore) ListInviteLinks(ctx context.Context, userID, workspaceID s
 }
 
 func (s *sqliteStore) CreateInviteLink(ctx context.Context, userID, workspaceID string, role core.WorkspaceRole, expiresAt *time.Time, maxUses *int) (*core.InviteLink, error) {
-	actorRole, err := s.resolveRole(ctx, userID, workspaceID)
-	if err != nil {
-		return nil, err
-	}
-	if err := requireAdmin(actorRole); err != nil {
-		return nil, err
-	}
 	if role == "" {
 		role = core.RoleMember
+	}
+	if !validWorkspaceRole(role) || (maxUses != nil && *maxUses <= 0) {
+		return nil, core.ErrInvalidInput
 	}
 
 	code, err := newInviteCode()
@@ -804,25 +1033,54 @@ func (s *sqliteStore) CreateInviteLink(ctx context.Context, userID, workspaceID 
 	}
 
 	id := ulid.Make().String()
-	if _, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_workspaces SET updated_at = updated_at WHERE id = ?`, workspaceID); err != nil {
+		return nil, err
+	}
+	actorRole, err := resolveRoleWith(ctx, tx, userID, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireAdmin(actorRole); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO shell_invite_links (id, workspace_id, code, role, expires_at, max_uses, uses, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?, 0, ?)`,
 		id, workspaceID, code, string(role), expiresArg, maxUsesArg, time.Now().UTC()); err != nil {
 		return nil, err
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT `+inviteLinkCols+` FROM shell_invite_links WHERE id = ?`, id)
-	return scanInviteLink(row)
+	link, err := scanInviteLink(tx.QueryRowContext(ctx, `SELECT `+inviteLinkCols+` FROM shell_invite_links WHERE id = ?`, id))
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return link, nil
 }
 
 func (s *sqliteStore) DeleteInviteLink(ctx context.Context, userID, workspaceID, linkID string) error {
-	role, err := s.resolveRole(ctx, userID, workspaceID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_workspaces SET updated_at = updated_at WHERE id = ?`, workspaceID); err != nil {
+		return err
+	}
+	role, err := resolveRoleWith(ctx, tx, userID, workspaceID)
 	if err != nil {
 		return err
 	}
 	if err := requireAdmin(role); err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM shell_invite_links WHERE id = ? AND workspace_id = ?`, linkID, workspaceID)
+	res, err := tx.ExecContext(ctx, `DELETE FROM shell_invite_links WHERE id = ? AND workspace_id = ?`, linkID, workspaceID)
 	if err != nil {
 		return err
 	}
@@ -833,40 +1091,17 @@ func (s *sqliteStore) DeleteInviteLink(ctx context.Context, userID, workspaceID,
 	if affected == 0 {
 		return core.ErrNotFound
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (s *sqliteStore) JoinViaInviteLink(ctx context.Context, userID, code string, user core.MemberUser) (*core.ShellWorkspace, error) {
 	if userID == "" || strings.TrimSpace(code) == "" {
 		return nil, core.ErrInvalidInput
 	}
-	if user.ID == "" {
-		user.ID = userID
-	}
+	// 身份以 JWT 解析出的 userID 为准，调用方资料不能写入其他用户的 profile。
+	user.ID = userID
 	if err := s.UpsertUserProfile(ctx, user); err != nil {
 		return nil, err
-	}
-
-	row := s.db.QueryRowContext(ctx, `SELECT `+inviteLinkCols+` FROM shell_invite_links WHERE code = ?`, strings.TrimSpace(code))
-	link, err := scanInviteLink(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, core.ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	// 已是成员：直接返回，不消耗次数，也不受过期/次数限制影响
-	if _, err := s.memberRole(ctx, userID, link.WorkspaceID); err == nil {
-		return s.GetShellWorkspace(ctx, userID, link.WorkspaceID)
-	} else if !errors.Is(err, core.ErrForbidden) {
-		return nil, err
-	}
-
-	if link.ExpiresAt != nil && time.Now().After(*link.ExpiresAt) {
-		return nil, fmt.Errorf("%w: invite link expired", core.ErrForbidden)
-	}
-	if link.MaxUses != nil && link.Uses >= *link.MaxUses {
-		return nil, fmt.Errorf("%w: invite link exhausted", core.ErrForbidden)
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -874,17 +1109,75 @@ func (s *sqliteStore) JoinViaInviteLink(ctx context.Context, userID, code string
 		return nil, err
 	}
 	defer tx.Rollback()
+	// 对邀请行做一次无值变化的 UPDATE，先取得 SQLite 写锁；随后读取的 uses、
+	// 过期时间、成员状态与次数递增属于同一串行化事务。
+	res, err := tx.ExecContext(ctx, `UPDATE shell_invite_links SET uses = uses WHERE code = ?`, strings.TrimSpace(code))
+	if err != nil {
+		return nil, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if affected == 0 {
+		return nil, core.ErrNotFound
+	}
+	link, err := scanInviteLink(tx.QueryRowContext(ctx, `SELECT `+inviteLinkCols+` FROM shell_invite_links WHERE code = ?`, strings.TrimSpace(code)))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, core.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var workspaceExists int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM shell_workspaces WHERE id = ?`, link.WorkspaceID).Scan(&workspaceExists); errors.Is(err, sql.ErrNoRows) {
+		return nil, core.ErrNotFound
+	} else if err != nil {
+		return nil, err
+	}
+	// 已是成员：直接返回，不消耗次数，也不受过期/次数限制影响
+	if _, err := memberRoleWith(ctx, tx, userID, link.WorkspaceID); err == nil {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return s.GetShellWorkspace(ctx, userID, link.WorkspaceID)
+	} else if !errors.Is(err, core.ErrForbidden) {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	if !validWorkspaceRole(link.Role) {
+		return nil, core.ErrForbidden
+	}
+	if link.ExpiresAt != nil && !link.ExpiresAt.After(now) {
+		return nil, fmt.Errorf("%w: invite link expired", core.ErrForbidden)
+	}
+	if link.MaxUses != nil && link.Uses >= *link.MaxUses {
+		return nil, fmt.Errorf("%w: invite link exhausted", core.ErrForbidden)
+	}
 
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO shell_members (id, workspace_id, user_id, role, created_at) VALUES (?, ?, ?, ?, ?)`,
-		ulid.Make().String(), link.WorkspaceID, userID, string(link.Role), time.Now().UTC()); err != nil {
+		ulid.Make().String(), link.WorkspaceID, userID, string(link.Role), now); err != nil {
 		return nil, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE shell_invite_links SET uses = uses + 1 WHERE id = ?`, link.ID); err != nil {
+	res, err = tx.ExecContext(ctx, `UPDATE shell_invite_links
+		SET uses = uses + 1
+		WHERE id = ?
+		  AND (expires_at IS NULL OR expires_at > ?)
+		  AND (max_uses IS NULL OR uses < max_uses)`, link.ID, now)
+	if err != nil {
 		return nil, err
+	}
+	affected, err = res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if affected != 1 {
+		return nil, fmt.Errorf("%w: invite link expired or exhausted", core.ErrForbidden)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE shell_workspaces SET type = 'SHARED', updated_at = ? WHERE id = ? AND type = 'PERSONAL'`,
-		time.Now().UTC(), link.WorkspaceID); err != nil {
+		now, link.WorkspaceID); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -920,7 +1213,11 @@ func scanCollection(sc rowScanner) (*core.Collection, error) {
 
 // collectionAccess 载入集合并校验访问权限，同时回填 CanWrite/IsOwner。
 func (s *sqliteStore) collectionAccess(ctx context.Context, userID, collectionID string) (*core.Collection, core.WorkspaceRole, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+shellCollectionCols+` FROM shell_collections c WHERE c.id = ?`, collectionID)
+	return collectionAccessWith(ctx, s.db, userID, collectionID)
+}
+
+func collectionAccessWith(ctx context.Context, ex sqlExecutor, userID, collectionID string) (*core.Collection, core.WorkspaceRole, error) {
+	row := ex.QueryRowContext(ctx, `SELECT `+shellCollectionCols+` FROM shell_collections c WHERE c.id = ?`, collectionID)
 	coll, err := scanCollection(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", core.ErrNotFound
@@ -929,7 +1226,7 @@ func (s *sqliteStore) collectionAccess(ctx context.Context, userID, collectionID
 		return nil, "", err
 	}
 
-	role, err := s.memberRole(ctx, userID, coll.WorkspaceID)
+	role, err := memberRoleWith(ctx, ex, userID, coll.WorkspaceID)
 	if err != nil {
 		return nil, "", err
 	}
@@ -967,24 +1264,35 @@ func (s *sqliteStore) ListCollections(ctx context.Context, userID, workspaceID s
 }
 
 func (s *sqliteStore) CreateCollection(ctx context.Context, userID, workspaceID, name string, icon, color *string, isPrivate bool) (*core.Collection, error) {
-	role, err := s.resolveRole(ctx, userID, workspaceID)
+	if strings.TrimSpace(name) == "" {
+		return nil, core.ErrInvalidInput
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_workspaces SET updated_at = updated_at WHERE id = ?`, workspaceID); err != nil {
+		return nil, err
+	}
+	role, err := resolveRoleWith(ctx, tx, userID, workspaceID)
 	if err != nil {
 		return nil, err
 	}
 	if err := requireWrite(role); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(name) == "" {
-		return nil, core.ErrInvalidInput
-	}
 
 	now := time.Now().UTC()
 	id := ulid.Make().String()
 	// 2A：集合不再区分 Private/共享，一律工作区内可见
-	if _, err := s.db.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO shell_collections (id, workspace_id, user_id, name, icon, color, is_private, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
 		id, workspaceID, userID, strings.TrimSpace(name), nullable(icon), nullable(color), now, now); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return s.GetCollection(ctx, userID, id)
@@ -996,7 +1304,15 @@ func (s *sqliteStore) GetCollection(ctx context.Context, userID, collectionID st
 }
 
 func (s *sqliteStore) UpdateCollection(ctx context.Context, userID, collectionID string, name, icon, color *string, isPrivate *bool) (*core.Collection, error) {
-	_, role, err := s.collectionAccess(ctx, userID, collectionID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_collections SET updated_at = updated_at WHERE id = ?`, collectionID); err != nil {
+		return nil, err
+	}
+	_, role, err := collectionAccessWith(ctx, tx, userID, collectionID)
 	if err != nil {
 		return nil, err
 	}
@@ -1022,27 +1338,28 @@ func (s *sqliteStore) UpdateCollection(ctx context.Context, userID, collectionID
 	if len(sets) > 0 {
 		sets = append(sets, "updated_at = ?")
 		args = append(args, time.Now().UTC(), collectionID)
-		if _, err := s.db.ExecContext(ctx,
+		if _, err := tx.ExecContext(ctx,
 			`UPDATE shell_collections SET `+strings.Join(sets, ", ")+` WHERE id = ?`, args...); err != nil {
 			return nil, err
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 	return s.GetCollection(ctx, userID, collectionID)
 }
 
 func (s *sqliteStore) DeleteCollection(ctx context.Context, userID, collectionID string) error {
-	coll, role, err := s.collectionAccess(ctx, userID, collectionID)
+	_, role, err := s.collectionAccess(ctx, userID, collectionID)
 	if err != nil {
 		return err
 	}
 	if err := requireWrite(role); err != nil {
 		return err
 	}
-	// 非所有者需管理员权限
-	if !coll.IsOwner {
-		if err := requireAdmin(role); err != nil {
-			return err
-		}
+	// 删除集合会级联删除全部 Scene，属于工作区管理操作。
+	if err := requireAdmin(role); err != nil {
+		return err
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1050,9 +1367,46 @@ func (s *sqliteStore) DeleteCollection(ctx context.Context, userID, collectionID
 		return err
 	}
 	defer tx.Rollback()
+	clientID := strings.TrimSpace(core.SceneClientIDFromContext(ctx))
+	// 先取得 SQLite 写锁，再检查活跃编辑状态；否则检查与批量删除之间仍可能
+	// 被另一客户端抢锁。Collection 删除不覆盖任何正在编辑的 Scene。
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_collections SET updated_at = updated_at WHERE id = ?`, collectionID); err != nil {
+		return err
+	}
+	_, role, err = collectionAccessWith(ctx, tx, userID, collectionID)
+	if err != nil {
+		return err
+	}
+	if err := requireAdmin(role); err != nil {
+		return err
+	}
+	var activeSceneID string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM canvases WHERE collection_id = ? AND (
+		collab_enabled = 1 OR (
+			edit_lock_user_id IS NOT NULL AND edit_lock_until > ?
+			AND NOT (edit_lock_user_id = ? AND edit_lock_client_id = ?)
+		)
+	) LIMIT 1`, collectionID, time.Now().UTC(), userID, clientID).Scan(&activeSceneID)
+	if err == nil {
+		st, stateErr := s.readCanvasEditState(ctx, tx, activeSceneID)
+		if stateErr != nil {
+			return stateErr
+		}
+		if st.collabEnabled {
+			return &core.SceneLockError{Message: "disable scene collaboration before deleting its collection"}
+		}
+		return &core.SceneLockError{Editor: st.leaseEditor(userID)}
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 
-	// 场景不随集合删除，先落回“未归类”
-	if _, err := tx.ExecContext(ctx, `UPDATE canvases SET collection_id = NULL WHERE collection_id = ?`, collectionID); err != nil {
+	// Collection 是 Scene 的业务归属边界。删除集合必须一并删除其中画布，
+	// 不能留下所有者仍可通过旧 URL 打开的“未归类”场景。
+	if err := deleteSceneDependentsByCollection(ctx, tx, collectionID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM canvases WHERE collection_id = ?`, collectionID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM shell_collections WHERE id = ?`, collectionID); err != nil {
@@ -1062,8 +1416,13 @@ func (s *sqliteStore) DeleteCollection(ctx context.Context, userID, collectionID
 }
 
 func (s *sqliteStore) CopyCollectionToWorkspace(ctx context.Context, userID, collectionID, targetWorkspaceID string) (*core.Collection, error) {
-	source, _, err := s.collectionAccess(ctx, userID, collectionID)
+	source, sourceRole, err := s.collectionAccess(ctx, userID, collectionID)
 	if err != nil {
+		return nil, err
+	}
+	// 复制会把全部 Scene 内容带到调用者可写的目标 Workspace，权限应与
+	// DuplicateScene 一致；VIEWER 不能借此把只读内容变成自己的副本。
+	if err := requireWrite(sourceRole); err != nil {
 		return nil, err
 	}
 	targetRole, err := s.resolveRole(ctx, userID, targetWorkspaceID)
@@ -1079,6 +1438,23 @@ func (s *sqliteStore) CopyCollectionToWorkspace(ctx context.Context, userID, col
 		return nil, err
 	}
 	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_collections SET updated_at = updated_at WHERE id = ?`, collectionID); err != nil {
+		return nil, err
+	}
+	source, sourceRole, err = collectionAccessWith(ctx, tx, userID, collectionID)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireWrite(sourceRole); err != nil {
+		return nil, err
+	}
+	targetRole, err = resolveRoleWith(ctx, tx, userID, targetWorkspaceID)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireWrite(targetRole); err != nil {
+		return nil, err
+	}
 
 	now := time.Now().UTC()
 	newID := ulid.Make().String()
@@ -1122,7 +1498,7 @@ func (s *sqliteStore) CopyCollectionToWorkspace(ctx context.Context, userID, col
 			`INSERT INTO canvases (id, user_id, name, thumbnail, data, workspace_id, collection_id, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			ulid.Make().String(), userID, nsString(cr.name), nsString(cr.thumbnail), cr.data,
-			core.DefaultWorkspaceID, newID, now, now); err != nil {
+			targetWorkspaceID, newID, now, now); err != nil {
 			return nil, err
 		}
 	}
@@ -1137,10 +1513,9 @@ func (s *sqliteStore) MoveCollectionToWorkspace(ctx context.Context, userID, col
 	if err != nil {
 		return nil, err
 	}
-	if !source.IsOwner {
-		if err := requireAdmin(sourceRole); err != nil {
-			return nil, err
-		}
+	// 移动集合会改变其中所有 Scene 的可见范围，只允许源工作区管理员执行。
+	if err := requireAdmin(sourceRole); err != nil {
+		return nil, err
 	}
 	targetRole, err := s.resolveRole(ctx, userID, targetWorkspaceID)
 	if err != nil {
@@ -1150,8 +1525,72 @@ func (s *sqliteStore) MoveCollectionToWorkspace(ctx context.Context, userID, col
 		return nil, err
 	}
 
-	if _, err := s.db.ExecContext(ctx, `UPDATE shell_collections SET workspace_id = ?, updated_at = ? WHERE id = ?`,
-		targetWorkspaceID, time.Now().UTC(), collectionID); err != nil {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	clientID := strings.TrimSpace(core.SceneClientIDFromContext(ctx))
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_collections SET updated_at = updated_at WHERE id = ?`, collectionID); err != nil {
+		return nil, err
+	}
+	source, sourceRole, err = collectionAccessWith(ctx, tx, userID, collectionID)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireAdmin(sourceRole); err != nil {
+		return nil, err
+	}
+	targetRole, err = resolveRoleWith(ctx, tx, userID, targetWorkspaceID)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireWrite(targetRole); err != nil {
+		return nil, err
+	}
+	if targetWorkspaceID != source.WorkspaceID {
+		var activeSceneID string
+		err := tx.QueryRowContext(ctx, `SELECT id FROM canvases WHERE collection_id = ? AND (
+			collab_enabled = 1 OR (
+				edit_lock_user_id IS NOT NULL AND edit_lock_until > ?
+				AND NOT (edit_lock_user_id = ? AND edit_lock_client_id = ?)
+			)
+		) LIMIT 1`, collectionID, now, userID, clientID).Scan(&activeSceneID)
+		if err == nil {
+			st, stateErr := s.readCanvasEditState(ctx, tx, activeSceneID)
+			if stateErr != nil {
+				return nil, stateErr
+			}
+			if st.collabEnabled {
+				return nil, &core.SceneLockError{Message: "disable scene collaboration before moving its collection"}
+			}
+			return nil, &core.SceneLockError{Editor: st.leaseEditor(userID)}
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_collections SET workspace_id = ?, updated_at = ? WHERE id = ?`,
+		targetWorkspaceID, now, collectionID); err != nil {
+		return nil, err
+	}
+	setClause := `workspace_id = ?, updated_at = ?`
+	if targetWorkspaceID != source.WorkspaceID {
+		// 有效锁只可能属于本次移动的 actor/client（其他写者已在上方拒绝）。
+		// 保留该锁，使当前标签可在目标 Workspace URL 重载前完成最后一次写入；
+		// ACL 已随 Collection 原子切换，源 Workspace 成员不能继续使用它。
+		setClause += `, collab_enabled = 0`
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE canvases SET `+setClause+` WHERE collection_id = ?`,
+		targetWorkspaceID, now, collectionID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE mcp_canvas_targets SET workspace_id = ? WHERE collection_id = ?`,
+		targetWorkspaceID, collectionID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return s.GetCollection(ctx, userID, collectionID)
@@ -1161,13 +1600,14 @@ func (s *sqliteStore) MoveCollectionToWorkspace(ctx context.Context, userID, col
 // 场景（scene id == canvas id）
 // ---------------------------------------------------------------------------
 
-const sceneCols = `id, user_id, name, thumbnail, collection_id, created_at, updated_at`
+const sceneCols = `id, user_id, name, thumbnail, workspace_id, collection_id, created_at, updated_at`
 
 type sceneRow struct {
 	id           string
 	ownerID      string
 	name         sql.NullString
 	thumbnail    sql.NullString
+	workspaceID  string
 	collectionID sql.NullString
 	createdAt    sql.NullTime
 	updatedAt    sql.NullTime
@@ -1175,7 +1615,7 @@ type sceneRow struct {
 
 func scanSceneRow(sc rowScanner) (*sceneRow, error) {
 	var r sceneRow
-	if err := sc.Scan(&r.id, &r.ownerID, &r.name, &r.thumbnail, &r.collectionID, &r.createdAt, &r.updatedAt); err != nil {
+	if err := sc.Scan(&r.id, &r.ownerID, &r.name, &r.thumbnail, &r.workspaceID, &r.collectionID, &r.createdAt, &r.updatedAt); err != nil {
 		return nil, err
 	}
 	return &r, nil
@@ -1188,6 +1628,7 @@ func (r *sceneRow) toScene(canEdit bool) *core.WorkspaceScene {
 		Title:        nsString(r.name),
 		ThumbnailURL: nsPtr(r.thumbnail),
 		StorageKey:   r.id,
+		WorkspaceID:  r.workspaceID,
 		CollectionID: nsPtr(r.collectionID),
 		CreatedAt:    ntTime(r.createdAt),
 		UpdatedAt:    updated,
@@ -1202,7 +1643,11 @@ func (r *sceneRow) toScene(canEdit bool) *core.WorkspaceScene {
 
 // sceneAccess 定位场景并计算是否可编辑。
 func (s *sqliteStore) sceneAccess(ctx context.Context, userID, sceneID string) (*sceneRow, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT `+sceneCols+` FROM canvases WHERE id = ? LIMIT 1`, sceneID)
+	return sceneAccessWith(ctx, s.db, userID, sceneID)
+}
+
+func sceneAccessWith(ctx context.Context, ex sqlExecutor, userID, sceneID string) (*sceneRow, bool, error) {
+	row := ex.QueryRowContext(ctx, `SELECT `+sceneCols+` FROM canvases WHERE id = ? LIMIT 1`, sceneID)
 	r, err := scanSceneRow(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, core.ErrNotFound
@@ -1210,14 +1655,15 @@ func (s *sqliteStore) sceneAccess(ctx context.Context, userID, sceneID string) (
 	if err != nil {
 		return nil, false, err
 	}
-	if r.ownerID == userID {
-		return r, true, nil
-	}
-	// 他人场景：必须通过所在集合的工作区成员身份访问
+	// Collection 是访问边界。即使用户是原始创建者，一旦被移出工作区也不能
+	// 继续通过旧 URL 访问该 Scene。
 	if !r.collectionID.Valid || r.collectionID.String == "" {
+		if r.ownerID == userID {
+			return r, true, nil
+		}
 		return nil, false, core.ErrForbidden
 	}
-	_, role, err := s.collectionAccess(ctx, userID, r.collectionID.String)
+	_, role, err := collectionAccessWith(ctx, ex, userID, r.collectionID.String)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1227,9 +1673,12 @@ func (s *sqliteStore) sceneAccess(ctx context.Context, userID, sceneID string) (
 func (s *sqliteStore) ListScenes(ctx context.Context, userID string, workspaceID, collectionID *string) ([]*core.WorkspaceScene, error) {
 	switch {
 	case collectionID != nil && *collectionID != "":
-		_, role, err := s.collectionAccess(ctx, userID, *collectionID)
+		collection, role, err := s.collectionAccess(ctx, userID, *collectionID)
 		if err != nil {
 			return nil, err
+		}
+		if workspaceID != nil && *workspaceID != "" && collection.WorkspaceID != *workspaceID {
+			return nil, core.ErrForbidden
 		}
 		return s.queryScenes(ctx, userID, role,
 			`SELECT `+sceneCols+` FROM canvases WHERE collection_id = ?`+workspaceListedSceneSQL("id")+` ORDER BY updated_at DESC`, *collectionID)
@@ -1240,7 +1689,7 @@ func (s *sqliteStore) ListScenes(ctx context.Context, userID string, workspaceID
 			return nil, err
 		}
 		return s.queryScenes(ctx, userID, role,
-			`SELECT cv.id, cv.user_id, cv.name, cv.thumbnail, cv.collection_id, cv.created_at, cv.updated_at
+			`SELECT cv.id, cv.user_id, cv.name, cv.thumbnail, cv.workspace_id, cv.collection_id, cv.created_at, cv.updated_at
 			 FROM canvases cv
 			 JOIN shell_collections c ON c.id = cv.collection_id
 			 WHERE c.workspace_id = ?`+workspaceListedSceneSQL("cv.id")+`
@@ -1302,9 +1751,21 @@ func (s *sqliteStore) CreateScene(ctx context.Context, userID string, title stri
 	if userID == "" {
 		return nil, core.ErrInvalidInput
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
 	var collArg any
+	workspaceID := core.DefaultWorkspaceID
 	if collectionID != nil && *collectionID != "" {
-		_, role, err := s.collectionAccess(ctx, userID, *collectionID)
+		// 取得 SQLite 写锁后再校验 Collection 与成员角色，使归属检查和 Scene
+		// 插入不可被并发删除、移动或成员移除穿插。
+		if _, err := tx.ExecContext(ctx, `UPDATE shell_collections SET updated_at = updated_at WHERE id = ?`, *collectionID); err != nil {
+			return nil, err
+		}
+		collection, role, err := collectionAccessWith(ctx, tx, userID, *collectionID)
 		if err != nil {
 			return nil, err
 		}
@@ -1312,12 +1773,18 @@ func (s *sqliteStore) CreateScene(ctx context.Context, userID string, title stri
 			return nil, err
 		}
 		collArg = *collectionID
+		workspaceID = collection.WorkspaceID
 	} else {
 		// 未指定集合时落入个人工作区默认集合，保证 Workspace 列表能看到。
-		if _, defaultCollID, err := createPersonalWorkspace(ctx, s.db, userID, "", true); err != nil {
+		if _, defaultCollID, err := createPersonalWorkspace(ctx, tx, userID, "", true); err != nil {
 			return nil, err
 		} else if defaultCollID != "" {
 			collArg = defaultCollID
+			collection, _, err := collectionAccessWith(ctx, tx, userID, defaultCollID)
+			if err != nil {
+				return nil, err
+			}
+			workspaceID = collection.WorkspaceID
 		}
 	}
 	if strings.TrimSpace(title) == "" {
@@ -1329,14 +1796,65 @@ func (s *sqliteStore) CreateScene(ctx context.Context, userID string, title stri
 
 	now := time.Now().UTC()
 	id := ulid.Make().String()
-	// workspace_id 保留 default 以兼容阶段一的分组视图
-	if _, err := s.db.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO canvases (id, user_id, name, thumbnail, data, workspace_id, collection_id, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, userID, title, derefOrEmpty(thumbnail), data, core.DefaultWorkspaceID, collArg, now, now); err != nil {
+		id, userID, title, derefOrEmpty(thumbnail), data, workspaceID, collArg, now, now); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return s.GetScene(ctx, userID, id)
+}
+
+// CreateMCPScene 在同一 SQLite 事务内完成 Collection ACL 重验、MCP 绑定和
+// Scene 插入。MCP handler 通过可选接口调用，避免“先校验、后用另一连接写入”
+// 导致 Collection 被删除/移动或成员被移除后仍创建孤儿 Scene。
+func (s *sqliteStore) CreateMCPScene(ctx context.Context, userID, sceneID, collectionID, title string, data []byte) (*core.WorkspaceScene, error) {
+	if userID == "" || sceneID == "" || collectionID == "" {
+		return nil, core.ErrInvalidInput
+	}
+	if strings.TrimSpace(title) == "" {
+		title = sceneID
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		data = []byte(`{"elements":[],"appState":{},"files":{}}`)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE shell_collections SET updated_at = updated_at WHERE id = ?`, collectionID); err != nil {
+		return nil, err
+	}
+	collection, role, err := collectionAccessWith(ctx, tx, userID, collectionID)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireWrite(role); err != nil {
+		return nil, err
+	}
+
+	now := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO mcp_canvas_targets (canvas_id, owner_user_id, workspace_id, collection_id, created_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		sceneID, userID, collection.WorkspaceID, collectionID, now); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO canvases (id, user_id, name, thumbnail, data, workspace_id, collection_id, created_at, updated_at)
+		 VALUES (?, ?, ?, '', ?, ?, ?, ?, ?)`,
+		sceneID, userID, title, data, collection.WorkspaceID, collectionID, now, now); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return s.GetScene(ctx, userID, sceneID)
 }
 
 func derefOrEmpty(p *string) string {
@@ -1372,9 +1890,15 @@ func (s *sqliteStore) UpdateScene(ctx context.Context, userID, sceneID string, t
 	if len(sets) > 0 {
 		sets = append(sets, "updated_at = ?")
 		args = append(args, time.Now().UTC(), r.ownerID, r.id)
-		if _, err := s.db.ExecContext(ctx,
-			`UPDATE canvases SET `+strings.Join(sets, ", ")+` WHERE user_id = ? AND id = ?`, args...); err != nil {
-			return nil, err
+		if data != nil || thumbnail != nil {
+			if err := s.execSceneContentWrite(ctx, userID, r.ownerID, r.id, strings.Join(sets, ", "), args[:len(args)-2]...); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := s.execSceneMetadataWrite(ctx, userID, r.ownerID, r.id,
+				strings.Join(sets, ", "), args[:len(args)-2]...); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return s.GetScene(ctx, userID, sceneID)
@@ -1388,12 +1912,8 @@ func (s *sqliteStore) UpdateSceneData(ctx context.Context, userID, sceneID strin
 	if !canEdit {
 		return core.ErrForbidden
 	}
-	if err := s.rejectIfExclusiveLockHeld(ctx, userID, sceneID); err != nil {
-		return err
-	}
-	_, err = s.db.ExecContext(ctx, `UPDATE canvases SET data = ?, updated_at = ? WHERE user_id = ? AND id = ?`,
-		data, time.Now().UTC(), r.ownerID, r.id)
-	return err
+	return s.execSceneContentWrite(ctx, userID, r.ownerID, r.id,
+		`data = ?, updated_at = ?`, data, time.Now().UTC())
 }
 
 func (s *sqliteStore) UploadSceneThumbnail(ctx context.Context, userID, sceneID string, thumbnail string) (string, error) {
@@ -1404,17 +1924,20 @@ func (s *sqliteStore) UploadSceneThumbnail(ctx context.Context, userID, sceneID 
 	if !canEdit {
 		return "", core.ErrForbidden
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE canvases SET thumbnail = ?, updated_at = ? WHERE user_id = ? AND id = ?`,
-		thumbnail, time.Now().UTC(), r.ownerID, r.id); err != nil {
+	if err := s.execSceneContentWrite(ctx, userID, r.ownerID, r.id,
+		`thumbnail = ?, updated_at = ?`, thumbnail, time.Now().UTC()); err != nil {
 		return "", err
 	}
 	return thumbnail, nil
 }
 
 func (s *sqliteStore) DeleteScene(ctx context.Context, userID, sceneID string) error {
-	r, _, err := s.sceneAccess(ctx, userID, sceneID)
+	r, canEdit, err := s.sceneAccess(ctx, userID, sceneID)
 	if err != nil {
 		return err
+	}
+	if !canEdit {
+		return core.ErrForbidden
 	}
 	// 只有拥有者或工作区管理员能删除
 	if r.ownerID != userID {
@@ -1426,34 +1949,110 @@ func (s *sqliteStore) DeleteScene(ctx context.Context, userID, sceneID string) e
 			return err
 		}
 	}
-	_, err = s.db.ExecContext(ctx, `DELETE FROM canvases WHERE user_id = ? AND id = ?`, r.ownerID, r.id)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE canvases SET updated_at = updated_at WHERE id = ?`, sceneID); err != nil {
+		return err
+	}
+	r, canEdit, err = sceneAccessWith(ctx, tx, userID, sceneID)
+	if err != nil {
+		return err
+	}
+	if !canEdit {
+		return core.ErrForbidden
+	}
+	if r.ownerID != userID {
+		_, role, err := collectionAccessWith(ctx, tx, userID, r.collectionID.String)
+		if err != nil {
+			return err
+		}
+		if err := requireAdmin(role); err != nil {
+			return err
+		}
+	}
+	if err := deleteSceneDependents(ctx, tx, sceneID); err != nil {
+		return err
+	}
+	clientID := strings.TrimSpace(core.SceneClientIDFromContext(ctx))
+	now := time.Now().UTC()
+	res, err := tx.ExecContext(ctx, `DELETE FROM canvases WHERE user_id = ? AND id = ? AND collab_enabled = 0 AND (
+		edit_lock_user_id IS NULL OR edit_lock_client_id IS NULL OR edit_lock_until IS NULL OR edit_lock_until <= ?
+		OR (edit_lock_user_id = ? AND edit_lock_client_id = ?)
+	)`, r.ownerID, r.id, now, userID, clientID)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		st, stateErr := s.readCanvasEditState(ctx, tx, sceneID)
+		if stateErr != nil {
+			return stateErr
+		}
+		if st.collabEnabled {
+			return &core.SceneLockError{Message: "disable scene collaboration before deleting it"}
+		}
+		return &core.SceneLockError{Editor: st.leaseEditor(userID)}
+	}
+	return tx.Commit()
 }
 
 func (s *sqliteStore) DuplicateScene(ctx context.Context, userID, sceneID string) (*core.WorkspaceScene, error) {
-	r, _, err := s.sceneAccess(ctx, userID, sceneID)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	data, err := s.GetSceneData(ctx, userID, sceneID)
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE canvases SET updated_at = updated_at WHERE id = ?`, sceneID); err != nil {
+		return nil, err
+	}
+	r, canEdit, err := sceneAccessWith(ctx, tx, userID, sceneID)
 	if err != nil {
+		return nil, err
+	}
+	if !canEdit {
+		return nil, core.ErrForbidden
+	}
+	var data []byte
+	if err := tx.QueryRowContext(ctx, `SELECT data FROM canvases WHERE user_id = ? AND id = ?`, r.ownerID, r.id).Scan(&data); err != nil {
 		return nil, err
 	}
 
 	now := time.Now().UTC()
 	newID := ulid.Make().String()
 	var collArg any
+	workspaceID := r.workspaceID
 	if r.collectionID.Valid && r.collectionID.String != "" {
 		collArg = r.collectionID.String
+		collection, _, err := collectionAccessWith(ctx, tx, userID, r.collectionID.String)
+		if err != nil {
+			return nil, err
+		}
+		workspaceID = collection.WorkspaceID
+	} else {
+		wsID, defaultCollectionID, err := createPersonalWorkspace(ctx, tx, userID, "", true)
+		if err != nil {
+			return nil, err
+		}
+		workspaceID = wsID
+		collArg = defaultCollectionID
 	}
 	title := nsString(r.name)
 	if title == "" {
 		title = "Untitled"
 	}
-	if _, err := s.db.ExecContext(ctx,
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO canvases (id, user_id, name, thumbnail, data, workspace_id, collection_id, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		newID, userID, title+" (Copy)", nsString(r.thumbnail), data, core.DefaultWorkspaceID, collArg, now, now); err != nil {
+		newID, userID, title+" (Copy)", nsString(r.thumbnail), data, workspaceID, collArg, now, now); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return s.GetScene(ctx, userID, newID)
@@ -1467,10 +2066,21 @@ func (s *sqliteStore) MoveScene(ctx context.Context, userID, sceneID string, col
 	if !canEdit {
 		return nil, core.ErrForbidden
 	}
+	sourceWorkspaceID := r.workspaceID
+	sourceRole := core.RoleAdmin
+	if r.collectionID.Valid && r.collectionID.String != "" {
+		sourceCollection, role, err := s.collectionAccess(ctx, userID, r.collectionID.String)
+		if err != nil {
+			return nil, err
+		}
+		sourceWorkspaceID = sourceCollection.WorkspaceID
+		sourceRole = role
+	}
 
 	var collArg any
+	workspaceID := ""
 	if collectionID != nil && *collectionID != "" {
-		_, role, err := s.collectionAccess(ctx, userID, *collectionID)
+		collection, role, err := s.collectionAccess(ctx, userID, *collectionID)
 		if err != nil {
 			return nil, err
 		}
@@ -1478,9 +2088,110 @@ func (s *sqliteStore) MoveScene(ctx context.Context, userID, sceneID string, col
 			return nil, err
 		}
 		collArg = *collectionID
+		workspaceID = collection.WorkspaceID
+	} else {
+		// 个人 Workspace/默认 Collection 只能在下方正式事务内创建。
+		// 这里仅延后跨 Workspace 权限判断，避免后续锁校验失败时留下旁路资源。
+		workspaceID = sourceWorkspaceID
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE canvases SET collection_id = ?, updated_at = ? WHERE user_id = ? AND id = ?`,
-		collArg, time.Now().UTC(), r.ownerID, r.id); err != nil {
+	// 跨 Workspace 移动会撤销源成员访问并把内容暴露给目标成员，属于权限边界
+	// 变更，只允许源 Workspace 管理员执行。Workspace 内整理仍允许 MEMBER。
+	if workspaceID != sourceWorkspaceID {
+		if err := requireAdmin(sourceRole); err != nil {
+			return nil, err
+		}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE canvases SET updated_at = updated_at WHERE id = ?`, sceneID); err != nil {
+		return nil, err
+	}
+	r, canEdit, err = sceneAccessWith(ctx, tx, userID, sceneID)
+	if err != nil {
+		return nil, err
+	}
+	if !canEdit {
+		return nil, core.ErrForbidden
+	}
+	sourceWorkspaceID = r.workspaceID
+	sourceRole = core.RoleAdmin
+	if r.collectionID.Valid && r.collectionID.String != "" {
+		sourceCollection, role, err := collectionAccessWith(ctx, tx, userID, r.collectionID.String)
+		if err != nil {
+			return nil, err
+		}
+		sourceWorkspaceID = sourceCollection.WorkspaceID
+		sourceRole = role
+	}
+	collArg = nil
+	workspaceID = ""
+	if collectionID != nil && *collectionID != "" {
+		collection, role, err := collectionAccessWith(ctx, tx, userID, *collectionID)
+		if err != nil {
+			return nil, err
+		}
+		if err := requireWrite(role); err != nil {
+			return nil, err
+		}
+		collArg = *collectionID
+		workspaceID = collection.WorkspaceID
+	} else {
+		wsID, defaultCollectionID, err := createPersonalWorkspace(ctx, tx, userID, "", true)
+		if err != nil {
+			return nil, err
+		}
+		workspaceID = wsID
+		collArg = defaultCollectionID
+	}
+	if workspaceID != sourceWorkspaceID {
+		if err := requireAdmin(sourceRole); err != nil {
+			return nil, err
+		}
+	}
+	now := time.Now().UTC()
+	clientID := strings.TrimSpace(core.SceneClientIDFromContext(ctx))
+	setClause := `collection_id = ?, workspace_id = ?, updated_at = ?`
+	args := []any{collArg, workspaceID, now}
+	if workspaceID != sourceWorkspaceID {
+		// 协作模式必须先显式关闭；有效独占锁只允许当前持锁管理员执行移动。
+		// 锁与 Scene 一起迁移，避免目标 URL 重载前出现无锁写入窗口。
+		setClause += `, collab_enabled = 0`
+	}
+	query := `UPDATE canvases SET ` + setClause + ` WHERE user_id = ? AND id = ? AND (
+		edit_lock_user_id IS NULL OR edit_lock_client_id IS NULL OR edit_lock_until IS NULL OR edit_lock_until <= ?
+		OR (edit_lock_user_id = ? AND edit_lock_client_id = ?)
+	)`
+	args = append(args, r.ownerID, r.id, now, userID, clientID)
+	if workspaceID != sourceWorkspaceID {
+		query += ` AND collab_enabled = 0`
+	}
+	res, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if affected == 0 {
+		st, stateErr := s.readCanvasEditState(ctx, tx, sceneID)
+		if stateErr != nil {
+			return nil, stateErr
+		}
+		if workspaceID != sourceWorkspaceID && st.collabEnabled {
+			return nil, &core.SceneLockError{Message: "disable scene collaboration before moving it to another workspace"}
+		}
+		return nil, &core.SceneLockError{Editor: st.leaseEditor(userID)}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE mcp_canvas_targets SET workspace_id = ?, collection_id = ? WHERE canvas_id = ?`,
+		workspaceID, collArg, sceneID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return s.GetScene(ctx, userID, sceneID)
@@ -1554,6 +2265,92 @@ func (s *sqliteStore) MigrateLegacyGroupsToShell(ctx context.Context) error {
 	return nil
 }
 
+// RepairSceneOwnership 修复旧版本或中断迁移留下的孤儿 Scene，并把冗余
+// workspace_id 重新对齐到 Collection。它在每次启动时幂等执行。
+func (s *sqliteStore) RepairSceneOwnership(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT DISTINCT cv.user_id
+		FROM canvases cv
+		LEFT JOIN shell_collections c ON c.id = cv.collection_id
+		WHERE cv.collection_id IS NULL OR cv.collection_id = '' OR c.id IS NULL`)
+	if err != nil {
+		return err
+	}
+	var users []string
+	for rows.Next() {
+		var userID string
+		if err := rows.Scan(&userID); err != nil {
+			rows.Close()
+			return err
+		}
+		users = append(users, userID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, userID := range users {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		workspaceID, collectionID, err := createPersonalWorkspace(ctx, tx, userID, "", true)
+		if err == nil {
+			_, err = tx.ExecContext(ctx, `
+				UPDATE canvases SET collection_id = ?, workspace_id = ?
+				WHERE user_id = ? AND (
+					collection_id IS NULL OR collection_id = ''
+					OR NOT EXISTS (SELECT 1 FROM shell_collections c WHERE c.id = canvases.collection_id)
+				)`, collectionID, workspaceID, userID)
+		}
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `
+		UPDATE canvases
+		SET workspace_id = (SELECT c.workspace_id FROM shell_collections c WHERE c.id = canvases.collection_id)
+		WHERE collection_id IS NOT NULL AND collection_id <> ''
+		AND EXISTS (SELECT 1 FROM shell_collections c WHERE c.id = canvases.collection_id)
+		AND workspace_id <> (SELECT c.workspace_id FROM shell_collections c WHERE c.id = canvases.collection_id)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM mcp_canvas_snapshots
+		WHERE NOT EXISTS (SELECT 1 FROM canvases cv WHERE cv.id = mcp_canvas_snapshots.canvas_id)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM mcp_canvas_targets
+		WHERE NOT EXISTS (
+			SELECT 1 FROM canvases cv
+			WHERE cv.id = mcp_canvas_targets.canvas_id AND cv.user_id = mcp_canvas_targets.owner_user_id
+		)`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE mcp_canvas_targets
+		SET workspace_id = (SELECT cv.workspace_id FROM canvases cv
+			WHERE cv.id = mcp_canvas_targets.canvas_id AND cv.user_id = mcp_canvas_targets.owner_user_id),
+			collection_id = (SELECT cv.collection_id FROM canvases cv
+			WHERE cv.id = mcp_canvas_targets.canvas_id AND cv.user_id = mcp_canvas_targets.owner_user_id)
+		WHERE EXISTS (
+			SELECT 1 FROM canvases cv
+			WHERE cv.id = mcp_canvas_targets.canvas_id AND cv.user_id = mcp_canvas_targets.owner_user_id
+		)`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *sqliteStore) migrateLegacyUser(ctx context.Context, userID string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1614,9 +2411,9 @@ func (s *sqliteStore) migrateLegacyUser(ctx context.Context, userID string) erro
 			privateID = collID
 		}
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE canvases SET collection_id = ?
+			`UPDATE canvases SET collection_id = ?, workspace_id = ?
 			 WHERE user_id = ? AND workspace_id = ? AND (collection_id IS NULL OR collection_id = '')`,
-			collID, userID, g.id); err != nil {
+			collID, wsID, userID, g.id); err != nil {
 			return err
 		}
 	}
@@ -1624,8 +2421,8 @@ func (s *sqliteStore) migrateLegacyUser(ctx context.Context, userID string) erro
 	// 兜底：分组已丢失的画布归入私有集合
 	if privateID != "" {
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE canvases SET collection_id = ? WHERE user_id = ? AND (collection_id IS NULL OR collection_id = '')`,
-			privateID, userID); err != nil {
+			`UPDATE canvases SET collection_id = ?, workspace_id = ? WHERE user_id = ? AND (collection_id IS NULL OR collection_id = '')`,
+			privateID, wsID, userID); err != nil {
 			return err
 		}
 	}

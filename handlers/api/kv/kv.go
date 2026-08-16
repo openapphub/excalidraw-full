@@ -87,6 +87,7 @@ func HandleGetCanvas(store stores.Store) http.HandlerFunc {
 
 func HandleSaveCanvas(store stores.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(core.WithSceneClientID(r.Context(), strings.TrimSpace(r.Header.Get("X-Scene-Client-ID"))))
 		claims, ok := r.Context().Value(middleware.ClaimsContextKey).(*auth.AppClaims)
 		if !ok {
 			render.Status(r, http.StatusUnauthorized)
@@ -98,6 +99,12 @@ func HandleSaveCanvas(store stores.Store) http.HandlerFunc {
 		if key == "" {
 			render.Status(r, http.StatusBadRequest)
 			render.JSON(w, r, map[string]string{"error": "Canvas key is required"})
+			return
+		}
+		existing, err := store.Get(r.Context(), claims.Subject, key)
+		if err != nil || existing == nil {
+			render.Status(r, http.StatusNotFound)
+			render.JSON(w, r, map[string]string{"error": "Canvas not found"})
 			return
 		}
 
@@ -149,8 +156,7 @@ func HandleSaveCanvas(store stores.Store) http.HandlerFunc {
 
 		// body 未携带 workspaceId 时，保留画布现有的分组归属。
 		if canvasWorkspaceID == "" {
-			existing, err := store.Get(r.Context(), claims.Subject, key)
-			if err == nil && existing != nil && existing.WorkspaceID != "" {
+			if existing.WorkspaceID != "" {
 				canvasWorkspaceID = existing.WorkspaceID
 			}
 		}
@@ -199,6 +205,7 @@ func HandleSaveCanvas(store stores.Store) http.HandlerFunc {
 
 func HandleDeleteCanvas(store stores.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(core.WithSceneClientID(r.Context(), strings.TrimSpace(r.Header.Get("X-Scene-Client-ID"))))
 		claims, ok := r.Context().Value(middleware.ClaimsContextKey).(*auth.AppClaims)
 		if !ok {
 			render.Status(r, http.StatusUnauthorized)
@@ -219,8 +226,25 @@ func HandleDeleteCanvas(store stores.Store) http.HandlerFunc {
 				"userID": claims.Subject,
 				"key":    key,
 			}).Error("Failed to delete canvas")
-			render.Status(r, http.StatusInternalServerError)
-			render.JSON(w, r, map[string]string{"error": "Failed to delete canvas"})
+			var lockErr *core.SceneLockError
+			switch {
+			case errors.As(err, &lockErr):
+				render.Status(r, http.StatusConflict)
+				render.JSON(w, r, map[string]any{
+					"error":   lockErr.Error(),
+					"message": lockErr.Error(),
+					"editor":  lockErr.Editor,
+				})
+			case errors.Is(err, core.ErrForbidden):
+				render.Status(r, http.StatusForbidden)
+				render.JSON(w, r, map[string]string{"error": "Access denied"})
+			case errors.Is(err, core.ErrNotFound):
+				render.Status(r, http.StatusNotFound)
+				render.JSON(w, r, map[string]string{"error": "Canvas not found"})
+			default:
+				render.Status(r, http.StatusInternalServerError)
+				render.JSON(w, r, map[string]string{"error": "Failed to delete canvas"})
+			}
 			return
 		}
 

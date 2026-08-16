@@ -378,6 +378,9 @@ func HandleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 }
 
 func createJWT(user *core.User) (string, error) {
+	if len(jwtSecret) < 32 {
+		return "", fmt.Errorf("JWT_SECRET must be at least 32 bytes")
+	}
 	claims := AppClaims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   user.Subject,
@@ -395,6 +398,9 @@ func createJWT(user *core.User) (string, error) {
 }
 
 func ParseJWT(tokenString string) (*AppClaims, error) {
+	if len(jwtSecret) < 32 {
+		return nil, fmt.Errorf("JWT authentication is not configured")
+	}
 	token, err := jwt.ParseWithClaims(tokenString, &AppClaims{}, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])

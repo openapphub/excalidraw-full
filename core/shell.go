@@ -83,6 +83,7 @@ type WorkspaceScene struct {
 	ThumbnailURL  *string      `json:"thumbnailUrl"`
 	StorageKey    string       `json:"storageKey"`
 	RoomID        *string      `json:"roomId"`
+	WorkspaceID   string       `json:"workspaceId"`
 	CollectionID  *string      `json:"collectionId"`
 	IsPublic      bool         `json:"isPublic"`
 	LastOpenedAt  *time.Time   `json:"lastOpenedAt"`
@@ -102,14 +103,31 @@ type SceneEditor struct {
 
 // SceneLockError is returned when another tab/user holds the exclusive edit lock.
 type SceneLockError struct {
-	Editor *SceneEditor
+	Editor  *SceneEditor
+	Message string
 }
 
 func (e *SceneLockError) Error() string {
+	if e != nil && e.Message != "" {
+		return e.Message
+	}
 	if e != nil && e.Editor != nil && e.Editor.Name != "" {
 		return e.Editor.Name + " 正在编辑"
 	}
 	return "scene is being edited"
+}
+
+type sceneClientIDContextKey struct{}
+
+// WithSceneClientID 把当前浏览器标签页或协作客户端标识带入持久层。
+// Scene 内容写入必须同时通过 ACL 与该客户端对应的锁/写者租约校验。
+func WithSceneClientID(ctx context.Context, clientID string) context.Context {
+	return context.WithValue(ctx, sceneClientIDContextKey{}, clientID)
+}
+
+func SceneClientIDFromContext(ctx context.Context) string {
+	clientID, _ := ctx.Value(sceneClientIDContextKey{}).(string)
+	return clientID
 }
 
 func (e *SceneLockError) Unwrap() error {

@@ -99,7 +99,7 @@ You must configure GitHub OAuth and a JWT secret for the application to function
 
 This configures the server's built-in storage, used by default.
 
-- `STORAGE_TYPE`: `memory` (default), `sqlite`, `filesystem`, or `s3`.    
+- `STORAGE_TYPE`: must be `sqlite` for the Workspace Shell service (also the default when unset).
 - `DATA_SOURCE_NAME`: Path for the SQLite DB (e.g., `excalidraw.db`).
 - `LOCAL_STORAGE_PATH`: Directory for filesystem storage.
 - `S3_BUCKET_NAME`, `AWS_REGION`, etc.: For S3 storage.
@@ -166,8 +166,7 @@ docker run -p 3002:3002 \
 
 ### Manual Build
 
-1.  **Build Frontend**: Follow the steps in the original README to patch and build the Excalidraw frontend inside the `excalidraw/` submodule.
-2.  **Copy Frontend**: Ensure the built frontend from `excalidraw/excalidraw-app/build` is copied to the `frontend/` directory in the root.
+1.  **Build Embedded Frontend**: Run `./scripts/build-embedded-frontend.sh`. It builds the `excalidraw/` submodule, stages the output, and replaces `frontend/` only after a successful build. Source maps are excluded because Go embeds every file in that directory.
 3.  **Build Go Backend**:
     ```bash
     go build -o excalidraw-complete main.go

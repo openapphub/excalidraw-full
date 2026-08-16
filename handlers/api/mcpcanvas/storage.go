@@ -1,7 +1,12 @@
 package mcpcanvas
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"excalidraw-complete/core"
+	"excalidraw-complete/handlers/api/roomaccess"
+	"excalidraw-complete/handlers/auth"
 	"fmt"
 	"io"
 	"mime"
@@ -12,7 +17,130 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/sirupsen/logrus"
 )
+
+const (
+	maxStorageUploadRequestBytes = 4 << 20
+	anonymousStorageTTL          = 24 * time.Hour
+	maxAnonymousStorageBytes     = 128 << 20
+)
+
+type storageObjectKey struct {
+	bucket string
+	path   string
+}
+
+type anonymousStorageObject struct {
+	data         []byte
+	contentType  string
+	cacheControl string
+	updatedAt    time.Time
+}
+
+func (s *Store) pruneAnonymousFilesLocked(now time.Time) {
+	for key, object := range s.anonymousFiles {
+		if now.Sub(object.updatedAt) < anonymousStorageTTL {
+			continue
+		}
+		delete(s.anonymousFiles, key)
+		s.anonymousFileBytes -= int64(len(object.data))
+	}
+}
+
+func (s *Store) storeAnonymousFile(key storageObjectKey, object anonymousStorageObject) {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+
+	if s.anonymousFiles == nil {
+		s.anonymousFiles = make(map[storageObjectKey]anonymousStorageObject)
+	}
+	s.pruneAnonymousFilesLocked(object.updatedAt)
+	if previous, ok := s.anonymousFiles[key]; ok {
+		s.anonymousFileBytes -= int64(len(previous.data))
+		delete(s.anonymousFiles, key)
+	}
+
+	for s.anonymousFileBytes+int64(len(object.data)) > maxAnonymousStorageBytes {
+		var oldestKey storageObjectKey
+		var oldest anonymousStorageObject
+		found := false
+		for candidateKey, candidate := range s.anonymousFiles {
+			if !found || candidate.updatedAt.Before(oldest.updatedAt) {
+				oldestKey = candidateKey
+				oldest = candidate
+				found = true
+			}
+		}
+		if !found {
+			break
+		}
+		delete(s.anonymousFiles, oldestKey)
+		s.anonymousFileBytes -= int64(len(oldest.data))
+	}
+
+	object.data = append([]byte(nil), object.data...)
+	s.anonymousFiles[key] = object
+	s.anonymousFileBytes += int64(len(object.data))
+}
+
+func (s *Store) loadAnonymousFile(key storageObjectKey, now time.Time) (anonymousStorageObject, bool) {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+
+	s.pruneAnonymousFilesLocked(now)
+	object, ok := s.anonymousFiles[key]
+	if !ok {
+		return anonymousStorageObject{}, false
+	}
+	object.data = append([]byte(nil), object.data...)
+	return object, true
+}
+
+func sceneIDFromStoragePath(path string) (string, bool) {
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if len(parts) < 4 || parts[0] != "files" || parts[1] != "rooms" || parts[2] == "" {
+		return "", false
+	}
+	return parts[2], true
+}
+
+func (s *Store) authorizeStorageObject(r *http.Request, path string, requireWrite bool) (roomaccess.Access, error) {
+	sceneID, ok := sceneIDFromStoragePath(path)
+	if !ok {
+		if !requireWrite {
+			return roomaccess.Access{}, nil
+		}
+		claims, err := auth.ParseJWT(roomaccess.BearerToken(r))
+		if err != nil {
+			return roomaccess.Access{}, core.ErrForbidden
+		}
+		return roomaccess.Access{UserID: claims.Subject, CanEdit: true}, nil
+	}
+	access, err := roomaccess.Authorize(r.Context(), s.host, sceneID, roomaccess.BearerToken(r))
+	if err != nil {
+		return roomaccess.Access{}, err
+	}
+	if access.WorkspaceScene && requireWrite && !access.CanEdit {
+		return roomaccess.Access{}, core.ErrForbidden
+	}
+	if access.WorkspaceScene && requireWrite {
+		checker, ok := s.host.(interface {
+			CheckSceneContentWrite(ctx context.Context, userID, sceneID string) error
+		})
+		if !ok {
+			return roomaccess.Access{}, core.ErrForbidden
+		}
+		ctx := core.WithSceneClientID(
+			r.Context(),
+			strings.TrimSpace(r.Header.Get("X-Scene-Client-ID")),
+		)
+		if err := checker.CheckSceneContentWrite(ctx, access.UserID, sceneID); err != nil {
+			return roomaccess.Access{}, err
+		}
+	}
+	return access, nil
+}
 
 // StoredFile is a row in the files table (Firebase Storage emulator).
 type StoredFile struct {
@@ -157,6 +285,7 @@ type storageObjectResponse struct {
 // Body: multipart/related with part 1 = JSON metadata, part 2 = file bytes.
 func (s *Store) handleStorageUpload(w http.ResponseWriter, r *http.Request) {
 	bucket := chi.URLParam(r, "bucket")
+	r.Body = http.MaxBytesReader(w, r.Body, maxStorageUploadRequestBytes)
 
 	// Parse multipart/related body: part 1 = JSON metadata, part 2 = bytes.
 	// Note: r.MultipartReader() only accepts multipart/form-data, but the
@@ -188,6 +317,11 @@ func (s *Store) handleStorageUpload(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(part)
 		part.Close()
 		if err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				http.Error(w, "storage object too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "error": err.Error()})
 			return
 		}
@@ -207,16 +341,49 @@ func (s *Store) handleStorageUpload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{"success": false, "error": "name is required"})
 		return
 	}
+	access, err := s.authorizeStorageObject(r, path, true)
+	if err != nil {
+		writeAccessErr(w, err)
+		return
+	}
 	contentType := meta.ContentType
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
 	now := time.Now()
-	_, err = s.db.Exec(`INSERT INTO files (path, bucket, data, content_type, cache_control, created_at, updated_at)
+	if _, isRoomFile := sceneIDFromStoragePath(path); isRoomFile && !access.WorkspaceScene {
+		s.storeAnonymousFile(storageObjectKey{bucket: bucket, path: path}, anonymousStorageObject{
+			data:         data,
+			contentType:  contentType,
+			cacheControl: meta.CacheControl,
+			updatedAt:    now,
+		})
+		writeJSON(w, http.StatusOK, storageObjectResponse{
+			Bucket:         bucket,
+			Generation:     fmt.Sprintf("%d", now.UnixNano()),
+			Metageneration: "1",
+			Name:           path,
+			Size:           fmt.Sprintf("%d", len(data)),
+			TimeCreated:    now.UTC().Format(time.RFC3339),
+			Updated:        now.UTC().Format(time.RFC3339),
+			Md5Hash:        meta.Md5Hash,
+			CacheControl:   meta.CacheControl,
+			ContentType:    contentType,
+			Metadata:       meta.CustomMetadata,
+		})
+		return
+	}
+	query := `INSERT INTO files (path, bucket, data, content_type, cache_control, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(bucket, path) DO UPDATE SET data=excluded.data, content_type=excluded.content_type,
-			cache_control=excluded.cache_control, updated_at=excluded.updated_at`,
-		path, bucket, data, contentType, meta.CacheControl, now, now)
+			cache_control=excluded.cache_control, updated_at=excluded.updated_at`
+	if strings.HasPrefix(path, "files/shareLinks/") {
+		// 分享链接没有单独的 ACL 归属表。文件 ID 一旦创建即不可变，避免知道公开
+		// 分享 ID 的其他登录用户覆盖原始附件；重复上传保持幂等成功。
+		query = `INSERT INTO files (path, bucket, data, content_type, cache_control, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(bucket, path) DO NOTHING`
+	}
+	_, err = s.db.Exec(query, path, bucket, data, contentType, meta.CacheControl, now, now)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{"success": false, "error": err.Error()})
 		return
@@ -246,11 +413,32 @@ func (s *Store) handleStorageDownload(w http.ResponseWriter, r *http.Request) {
 	if decoded, err := url.PathUnescape(path); err == nil {
 		path = decoded
 	}
-	fmt.Printf("[storage] download bucket=%s path=%q\n", bucket, path)
+	logrus.WithFields(logrus.Fields{"bucket": bucket, "path": path}).Debug("storage: download")
+	access, err := s.authorizeStorageObject(r, path, false)
+	if err != nil {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	if _, isRoomFile := sceneIDFromStoragePath(path); isRoomFile && !access.WorkspaceScene {
+		object, ok := s.loadAnonymousFile(storageObjectKey{bucket: bucket, path: path}, time.Now())
+		if !ok {
+			http.Error(w, "Not Found", http.StatusNotFound)
+			return
+		}
+		if object.contentType == "" {
+			object.contentType = "application/octet-stream"
+		}
+		if object.cacheControl != "" {
+			w.Header().Set("Cache-Control", object.cacheControl)
+		}
+		w.Header().Set("Content-Type", object.contentType)
+		_, _ = w.Write(object.data)
+		return
+	}
 
 	var data []byte
 	var contentType, cacheControl string
-	err := s.db.QueryRow(`SELECT data, content_type, cache_control FROM files WHERE path = ? AND bucket = ?`,
+	err = s.db.QueryRow(`SELECT data, content_type, cache_control FROM files WHERE path = ? AND bucket = ?`,
 		path, bucket).Scan(&data, &contentType, &cacheControl)
 	if err != nil {
 		http.Error(w, "Not Found", http.StatusNotFound)
@@ -259,7 +447,9 @@ func (s *Store) handleStorageDownload(w http.ResponseWriter, r *http.Request) {
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
-	if cacheControl != "" {
+	if access.WorkspaceScene {
+		w.Header().Set("Cache-Control", "private, no-store")
+	} else if cacheControl != "" {
 		w.Header().Set("Cache-Control", cacheControl)
 	}
 	w.Header().Set("Content-Type", contentType)

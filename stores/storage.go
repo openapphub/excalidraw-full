@@ -2,9 +2,6 @@ package stores
 
 import (
 	"excalidraw-complete/core"
-	"excalidraw-complete/stores/aws"
-	"excalidraw-complete/stores/filesystem"
-	"excalidraw-complete/stores/memory"
 	"excalidraw-complete/stores/sqlite"
 	"os"
 
@@ -30,30 +27,20 @@ func GetStore() Store {
 	}
 
 	switch storageType {
-	case "filesystem":
-		basePath := os.Getenv("LOCAL_STORAGE_PATH")
-		if basePath == "" {
-			basePath = "./data" // Default path
-		}
-		storageField["basePath"] = basePath
-		store = filesystem.NewStore(basePath)
-	case "sqlite":
+	case "", "sqlite":
 		dataSourceName := os.Getenv("DATA_SOURCE_NAME")
 		if dataSourceName == "" {
 			dataSourceName = "excalidraw.db" // Default filename
 		}
+		storageField["storageType"] = "sqlite"
 		storageField["dataSourceName"] = dataSourceName
 		store = sqlite.NewStore(dataSourceName)
-	case "s3":
-		bucketName := os.Getenv("S3_BUCKET_NAME")
-		if bucketName == "" {
-			logrus.Fatal("S3_BUCKET_NAME environment variable must be set for s3 storage type")
-		}
-		storageField["bucketName"] = bucketName
-		store = aws.NewStore(bucketName)
 	default:
-		store = memory.NewStore()
-		storageField["storageType"] = "in-memory"
+		logrus.Fatalf(
+			"STORAGE_TYPE=%q does not support Workspace Shell ACL, transactions, and scene locks; use STORAGE_TYPE=sqlite",
+			storageType,
+		)
+		return nil
 	}
 	logrus.WithFields(storageField).Info("Use storage")
 	return store

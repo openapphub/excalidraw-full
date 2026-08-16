@@ -10,6 +10,8 @@ import (
 	"excalidraw-complete/stores"
 	"io"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -87,6 +89,11 @@ func readJSON(r *http.Request, dst interface{}) error {
 	return json.Unmarshal(body, dst)
 }
 
+func withSceneClient(r *http.Request) *http.Request {
+	clientID := strings.TrimSpace(r.Header.Get("X-Scene-Client-ID"))
+	return r.WithContext(core.WithSceneClientID(r.Context(), clientID))
+}
+
 // ---- Workspaces ----
 
 func HandleListWorkspaces(store stores.Store) http.HandlerFunc {
@@ -107,6 +114,160 @@ func HandleListWorkspaces(store stores.Store) http.HandlerFunc {
 			list = []*core.ShellWorkspace{}
 		}
 		render.JSON(w, r, list)
+	}
+}
+
+type globalSearchCollectionResult struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	Icon          *string   `json:"icon"`
+	IsPrivate     bool      `json:"isPrivate"`
+	WorkspaceID   string    `json:"workspaceId"`
+	WorkspaceName string    `json:"workspaceName"`
+	WorkspaceSlug string    `json:"workspaceSlug"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
+type globalSearchSceneResult struct {
+	ID             string    `json:"id"`
+	Title          string    `json:"title"`
+	ThumbnailURL   *string   `json:"thumbnailUrl"`
+	CollectionID   *string   `json:"collectionId"`
+	CollectionName *string   `json:"collectionName"`
+	IsPrivate      bool      `json:"isPrivate"`
+	WorkspaceID    string    `json:"workspaceId"`
+	WorkspaceName  string    `json:"workspaceName"`
+	WorkspaceSlug  string    `json:"workspaceSlug"`
+	UpdatedAt      time.Time `json:"updatedAt"`
+}
+
+// HandleGlobalSearch 聚合当前用户可访问的 Workspace 元数据。
+// 每个底层列表调用都会重新校验成员关系，避免搜索接口形成独立 ACL 旁路。
+func HandleGlobalSearch(store stores.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := userFromContext(r)
+		if !ok {
+			render.Status(r, http.StatusUnauthorized)
+			render.JSON(w, r, map[string]string{"message": "Not authenticated"})
+			return
+		}
+		ensureProfile(store, r, claims)
+
+		limit := 50
+		if rawLimit := strings.TrimSpace(r.URL.Query().Get("limit")); rawLimit != "" {
+			parsed, err := strconv.Atoi(rawLimit)
+			if err != nil || parsed < 1 {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, map[string]string{"message": "limit must be a positive integer"})
+				return
+			}
+			if parsed > 100 {
+				parsed = 100
+			}
+			limit = parsed
+		}
+		query := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+		matches := func(values ...string) bool {
+			if query == "" {
+				return true
+			}
+			for _, value := range values {
+				if strings.Contains(strings.ToLower(value), query) {
+					return true
+				}
+			}
+			return false
+		}
+
+		workspaces, err := store.ListShellWorkspaces(r.Context(), claims.Subject)
+		if err != nil {
+			writeErr(w, r, err, "Failed to search workspaces")
+			return
+		}
+		collectionResults := make([]globalSearchCollectionResult, 0)
+		sceneResults := make([]globalSearchSceneResult, 0)
+		for _, workspace := range workspaces {
+			collections, err := store.ListCollections(r.Context(), claims.Subject, workspace.ID)
+			if errors.Is(err, core.ErrForbidden) || errors.Is(err, core.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				writeErr(w, r, err, "Failed to search collections")
+				return
+			}
+			workspaceID := workspace.ID
+			scenes, err := store.ListScenes(r.Context(), claims.Subject, &workspaceID, nil)
+			if errors.Is(err, core.ErrForbidden) || errors.Is(err, core.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				writeErr(w, r, err, "Failed to search scenes")
+				return
+			}
+
+			collectionsByID := make(map[string]*core.Collection, len(collections))
+			workspaceCollections := make([]globalSearchCollectionResult, 0, len(collections))
+			for _, collection := range collections {
+				collectionsByID[collection.ID] = collection
+				if !matches(collection.Name, workspace.Name) {
+					continue
+				}
+				workspaceCollections = append(workspaceCollections, globalSearchCollectionResult{
+					ID:            collection.ID,
+					Name:          collection.Name,
+					Icon:          collection.Icon,
+					IsPrivate:     collection.IsPrivate,
+					WorkspaceID:   workspace.ID,
+					WorkspaceName: workspace.Name,
+					WorkspaceSlug: workspace.Slug,
+					UpdatedAt:     collection.UpdatedAt,
+				})
+			}
+
+			workspaceScenes := make([]globalSearchSceneResult, 0, len(scenes))
+			for _, scene := range scenes {
+				if !matches(scene.Title, workspace.Name) || scene.CollectionID == nil {
+					continue
+				}
+				collection, exists := collectionsByID[*scene.CollectionID]
+				if !exists {
+					continue
+				}
+				collectionName := collection.Name
+				workspaceScenes = append(workspaceScenes, globalSearchSceneResult{
+					ID:             scene.ID,
+					Title:          scene.Title,
+					ThumbnailURL:   scene.ThumbnailURL,
+					CollectionID:   scene.CollectionID,
+					CollectionName: &collectionName,
+					IsPrivate:      collection.IsPrivate,
+					WorkspaceID:    workspace.ID,
+					WorkspaceName:  workspace.Name,
+					WorkspaceSlug:  workspace.Slug,
+					UpdatedAt:      scene.UpdatedAt,
+				})
+			}
+			collectionResults = append(collectionResults, workspaceCollections...)
+			sceneResults = append(sceneResults, workspaceScenes...)
+		}
+
+		sort.Slice(collectionResults, func(i, j int) bool {
+			return collectionResults[i].UpdatedAt.After(collectionResults[j].UpdatedAt)
+		})
+		sort.Slice(sceneResults, func(i, j int) bool {
+			return sceneResults[i].UpdatedAt.After(sceneResults[j].UpdatedAt)
+		})
+		if len(collectionResults) > limit {
+			collectionResults = collectionResults[:limit]
+		}
+		if len(sceneResults) > limit {
+			sceneResults = sceneResults[:limit]
+		}
+
+		render.JSON(w, r, map[string]interface{}{
+			"collections": collectionResults,
+			"scenes":      sceneResults,
+		})
 	}
 }
 
@@ -233,6 +394,7 @@ func HandleUploadWorkspaceAvatar(store stores.Store) http.HandlerFunc {
 
 func HandleDeleteWorkspace(store stores.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r = withSceneClient(r)
 		claims, ok := userFromContext(r)
 		if !ok {
 			render.Status(r, http.StatusUnauthorized)
@@ -543,6 +705,7 @@ func HandleUpdateCollection(store stores.Store) http.HandlerFunc {
 
 func HandleDeleteCollection(store stores.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r = withSceneClient(r)
 		claims, ok := userFromContext(r)
 		if !ok {
 			render.Status(r, http.StatusUnauthorized)
@@ -584,6 +747,7 @@ func HandleCopyCollection(store stores.Store) http.HandlerFunc {
 
 func HandleMoveCollection(store stores.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r = withSceneClient(r)
 		claims, ok := userFromContext(r)
 		if !ok {
 			render.Status(r, http.StatusUnauthorized)
@@ -709,6 +873,7 @@ func HandleCreateScene(store stores.Store) http.HandlerFunc {
 
 func HandleUpdateScene(store stores.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r = withSceneClient(r)
 		claims, ok := userFromContext(r)
 		if !ok {
 			render.Status(r, http.StatusUnauthorized)
@@ -740,6 +905,7 @@ func HandleUpdateScene(store stores.Store) http.HandlerFunc {
 
 func HandleUpdateSceneData(store stores.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r = withSceneClient(r)
 		claims, ok := userFromContext(r)
 		if !ok {
 			render.Status(r, http.StatusUnauthorized)
@@ -763,6 +929,7 @@ func HandleUpdateSceneData(store stores.Store) http.HandlerFunc {
 
 func HandleUploadSceneThumbnail(store stores.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r = withSceneClient(r)
 		claims, ok := userFromContext(r)
 		if !ok {
 			render.Status(r, http.StatusUnauthorized)
@@ -790,6 +957,7 @@ func HandleUploadSceneThumbnail(store stores.Store) http.HandlerFunc {
 
 func HandleDeleteScene(store stores.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r = withSceneClient(r)
 		claims, ok := userFromContext(r)
 		if !ok {
 			render.Status(r, http.StatusUnauthorized)
@@ -824,6 +992,7 @@ func HandleDuplicateScene(store stores.Store) http.HandlerFunc {
 
 func HandleMoveScene(store stores.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r = withSceneClient(r)
 		claims, ok := userFromContext(r)
 		if !ok {
 			render.Status(r, http.StatusUnauthorized)
@@ -913,6 +1082,7 @@ func HandleDisableSceneCollab(store stores.Store) http.HandlerFunc {
 }
 
 func handleSetSceneCollab(store stores.Store, w http.ResponseWriter, r *http.Request, enabled bool) {
+	r = withSceneClient(r)
 	claims, ok := userFromContext(r)
 	if !ok {
 		render.Status(r, http.StatusUnauthorized)
