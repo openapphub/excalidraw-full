@@ -2,7 +2,6 @@ package mcpcanvas
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"sync"
 	"time"
@@ -163,12 +162,13 @@ func (s *Store) ServeWS(w http.ResponseWriter, r *http.Request) {
 		initErr error
 	)
 	func() {
-		// 初始快照生成、连接注册和发送期间保持读锁，避免漏掉并发增量事件。
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		st, canvasOK := s.canvases[canvasID]
-		if !canvasOK {
-			initErr = fmt.Errorf("canvas %s not found", canvasID)
+		// 普通 Scene 需要在注册前按需加载；初始快照、连接注册和发送期间
+		// 保持同一把锁，避免加载完成后漏掉并发增量事件。
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		st, err := s.loadCanvasLocked(r.Context(), userID, canvasID)
+		if err != nil {
+			initErr = err
 			return
 		}
 		var all []map[string]interface{}

@@ -7,10 +7,15 @@ import (
 	"unicode"
 )
 
-// Format conversion between the mcp-excalidraw "agent format" (text/label/
-// start/end, no Excalidraw internals) and the native Excalidraw element
-// format the host app's `canvases` table stores (seed/versionNonce/
-// boundElements/startBinding/endBinding/...).
+const (
+	// 仅存在于服务端内存中的标记，不得返回给客户端或写入 Scene JSON。
+	nativeLayoutMarker    = "__mcpcanvasNativeLayout"
+	resolveBindingsMarker = "__mcpcanvasResolveBindings"
+)
+
+// Format conversion between the mcp-excalidraw agent format and the native
+// Excalidraw element format. New agent elements may be sparse; elements loaded
+// from an existing Scene retain their native fields to make round trips lossless.
 
 // agentToNative converts one agent-format element into a native Excalidraw
 // element. Bound text (label/text on shapes and arrows) becomes a separate
@@ -20,10 +25,12 @@ import (
 // element list right after its parent.
 func agentToNative(el map[string]interface{}) (map[string]interface{}, map[string]interface{}) {
 	typ, _ := el["type"].(string)
+	preserveNativeLayout, _ := el[nativeLayoutMarker].(bool)
 	base := make(map[string]interface{}, 24)
 	for k, v := range el {
 		switch k {
-		case "createdAt", "updatedAt", "syncedAt", "source", "syncTimestamp", "label", "start", "end", "text", "version":
+		case "createdAt", "updatedAt", "syncedAt", "source", "syncTimestamp", "label", "start", "end", "text",
+			nativeLayoutMarker, resolveBindingsMarker:
 			// server-only / agent-only fields stripped
 		default:
 			base[k] = v
@@ -130,13 +137,17 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 				endID = s
 			}
 		}
-		if startID != "" {
+		if startID != "" && (!preserveNativeLayout || base["startBinding"] == nil) {
 			base["startBinding"] = map[string]interface{}{"elementId": startID, "focus": 0, "gap": 4, "fixedPoint": nil}
+		} else if startID == "" && !preserveNativeLayout {
+			base["startBinding"] = nil
 		} else if _, ok := base["startBinding"]; !ok {
 			base["startBinding"] = nil
 		}
-		if endID != "" {
+		if endID != "" && (!preserveNativeLayout || base["endBinding"] == nil) {
 			base["endBinding"] = map[string]interface{}{"elementId": endID, "focus": 0, "gap": 4, "fixedPoint": nil}
+		} else if endID == "" && !preserveNativeLayout {
+			base["endBinding"] = nil
 		} else if _, ok := base["endBinding"]; !ok {
 			base["endBinding"] = nil
 		}
@@ -152,6 +163,9 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 		}
 		if _, ok := base["elbowed"]; !ok {
 			base["elbowed"] = false
+		}
+		if !preserveNativeLayout {
+			base[resolveBindingsMarker] = true
 		}
 	}
 
@@ -197,10 +211,12 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 	}
 
 	// Shape with label/text: create bound text element
+	label, _ := el["label"].(map[string]interface{})
 	labelText := ""
-	if label, ok := el["label"].(map[string]interface{}); ok {
+	if label != nil {
 		labelText, _ = label["text"].(string)
 	}
+	removeBoundTextBindings(base)
 	if labelText == "" {
 		labelText, _ = el["text"].(string)
 	}
@@ -209,6 +225,9 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 	}
 	id, _ := el["id"].(string)
 	textID := id + "-label"
+	if existingID, _ := label["id"].(string); existingID != "" {
+		textID = existingID
+	}
 	// Add binding reference to parent
 	be, _ := base["boundElements"].([]interface{})
 	base["boundElements"] = append(be, map[string]interface{}{"type": "text", "id": textID})
@@ -266,7 +285,9 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 	if typ == "arrow" || typ == "line" {
 		fs = 14
 	}
-	if f, ok := num(base["fontSize"]); ok && f > 0 {
+	if f, ok := num(label["fontSize"]); ok && f > 0 {
+		fs = f
+	} else if f, ok := num(base["fontSize"]); ok && f > 0 {
 		fs = f
 	}
 	textEl := map[string]interface{}{
@@ -286,7 +307,43 @@ func agentToNative(el map[string]interface{}) (map[string]interface{}, map[strin
 		"autoResize": true, "lineHeight": 1.25,
 		"containerId": id,
 	}
+	for key, value := range label {
+		switch key {
+		case "id", "type", "text", "originalText", "containerId", nativeLayoutMarker, resolveBindingsMarker:
+			continue
+		case "x", "y", "width", "height":
+			if !preserveNativeLayout {
+				continue
+			}
+		}
+		textEl[key] = value
+	}
+	textEl["id"] = textID
+	textEl["type"] = "text"
+	textEl["text"] = labelText
+	textEl["originalText"] = labelText
+	textEl["containerId"] = id
 	return base, textEl
+}
+
+func removeBoundTextBindings(base map[string]interface{}) {
+	bindings, ok := base["boundElements"].([]interface{})
+	if !ok {
+		return
+	}
+	filtered := make([]interface{}, 0, len(bindings))
+	for _, binding := range bindings {
+		bindingMap, _ := binding.(map[string]interface{})
+		if bindingMap["type"] == "text" {
+			continue
+		}
+		filtered = append(filtered, binding)
+	}
+	if len(filtered) == 0 {
+		base["boundElements"] = nil
+		return
+	}
+	base["boundElements"] = filtered
 }
 
 // textMetrics 以显示宽度估算文字盒：CJK 约为 1em，ASCII 约为 0.6em。
@@ -332,13 +389,21 @@ func textMetrics(text string, fontSize float64) (float64, float64) {
 func resolveArrowBindings(native []map[string]interface{}) {
 	byID := map[string]map[string]interface{}{}
 	for _, el := range native {
+		delete(el, nativeLayoutMarker)
 		if id, ok := el["id"].(string); ok {
 			byID[id] = el
 		}
 	}
+	resolvedArrowIDs := map[string]struct{}{}
 	for _, el := range native {
 		typ, _ := el["type"].(string)
 		if typ != "arrow" && typ != "line" {
+			delete(el, resolveBindingsMarker)
+			continue
+		}
+		shouldResolve, _ := el[resolveBindingsMarker].(bool)
+		delete(el, resolveBindingsMarker)
+		if !shouldResolve {
 			continue
 		}
 		startID := ""
@@ -387,14 +452,17 @@ func resolveArrowBindings(native []map[string]interface{}) {
 		// points 会让箭头只剩标签或退化成极短线段。
 		el["width"] = math.Abs(finalEnd[0] - finalStart[0])
 		el["height"] = math.Abs(finalEnd[1] - finalStart[1])
+		if id, _ := el["id"].(string); id != "" {
+			resolvedArrowIDs[id] = struct{}{}
+		}
 	}
-	positionArrowLabels(native)
+	positionArrowLabels(native, resolvedArrowIDs)
 }
 
 // positionArrowLabels 在箭头路径解析后重算绑定标签位置。agentToNative
 // 生成标签时尚无最终边到边路径；若不在这里更新，标签会留在默认 (0,0)->(100,0)
 // 的中点，和真实箭头脱离。
-func positionArrowLabels(native []map[string]interface{}) {
+func positionArrowLabels(native []map[string]interface{}, resolvedArrowIDs map[string]struct{}) {
 	byID := make(map[string]map[string]interface{}, len(native))
 	for _, el := range native {
 		if id, ok := el["id"].(string); ok && id != "" {
@@ -408,6 +476,9 @@ func positionArrowLabels(native []map[string]interface{}) {
 		}
 		arrowID, _ := arrow["id"].(string)
 		if arrowID == "" {
+			continue
+		}
+		if _, ok := resolvedArrowIDs[arrowID]; !ok {
 			continue
 		}
 		var label map[string]interface{}
@@ -523,26 +594,16 @@ func edgePoint(el map[string]interface{}, target [2]float64) [2]float64 {
 	}
 }
 
-// nativeToAgent converts a native Excalidraw element back to agent format:
-// strips Excalidraw internals, converts startBinding/endBinding back to
-// start/end refs. Bound text elements are folded back into their parent's
-// `label` by the caller (load), which has the full element list.
+// nativeToAgent converts a native Excalidraw element back to agent format.
+// 原生字段必须完整保留，否则普通 Scene 的一次无关增量写入也会重置样式、
+// 分组、锁定状态或箭头几何。start/end 只是绑定关系的便捷别名。
 func nativeToAgent(el map[string]interface{}) map[string]interface{} {
 	typ, _ := el["type"].(string)
-	agent := make(map[string]interface{}, 16)
+	agent := make(map[string]interface{}, len(el)+3)
 	for k, v := range el {
-		switch k {
-		case "seed", "versionNonce", "isDeleted", "updated", "index", "lastCommittedPoint",
-			"elbowed", "baseline", "autoResize", "lineHeight", "containerId",
-			"originalText", "textAlign", "verticalAlign", "fontFamily", "fontSize",
-			"startBinding", "endBinding", "boundElements", "frameId", "roundness",
-			"groupIds", "link", "locked", "angle", "fillStyle", "strokeStyle",
-			"strokeWidth", "roughness", "opacity", "version":
-			// Excalidraw internals stripped
-		default:
-			agent[k] = v
-		}
+		agent[k] = v
 	}
+	agent[nativeLayoutMarker] = true
 	// Arrow bindings -> start/end refs
 	if typ == "arrow" || typ == "line" {
 		if sb, ok := el["startBinding"].(map[string]interface{}); ok {

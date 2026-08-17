@@ -40,14 +40,15 @@ func (s *Store) handleSnapshotSave(w http.ResponseWriter, r *http.Request) {
 		writeAccessErr(w, err)
 		return
 	}
-	s.mu.RLock()
-	_, exists := s.targets[canvasID]
+	userID, _ := requestActor(r)
+	s.mu.Lock()
+	_, loadErr := s.loadCanvasLocked(r.Context(), userID, canvasID)
 	all := s.getAll(canvasID)
 	// 深拷贝，锁外安全序列化（避免并发 map 读写 panic）
 	all = cloneElementsForRead(all)
-	s.mu.RUnlock()
-	if !exists {
-		writeErr(w, http.StatusNotFound, "Canvas "+canvasID+" not found")
+	s.mu.Unlock()
+	if loadErr != nil {
+		writeAccessErr(w, loadErr)
 		return
 	}
 	data, err := json.Marshal(all)
@@ -81,11 +82,12 @@ func (s *Store) handleSnapshotList(w http.ResponseWriter, r *http.Request) {
 		writeAccessErr(w, err)
 		return
 	}
-	s.mu.RLock()
-	_, exists := s.targets[canvasID]
-	s.mu.RUnlock()
-	if !exists {
-		writeErr(w, http.StatusNotFound, "Canvas "+canvasID+" not found")
+	userID, _ := requestActor(r)
+	s.mu.Lock()
+	_, loadErr := s.loadCanvasLocked(r.Context(), userID, canvasID)
+	s.mu.Unlock()
+	if loadErr != nil {
+		writeAccessErr(w, loadErr)
 		return
 	}
 	rows, err := s.db.Query(`SELECT name, elements, created_at FROM mcp_canvas_snapshots WHERE canvas_id = ? ORDER BY created_at DESC`, canvasID)

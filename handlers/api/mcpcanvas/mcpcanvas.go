@@ -11,6 +11,7 @@ import (
 	"excalidraw-complete/stores"
 	"fmt"
 	"math"
+	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
@@ -27,8 +28,8 @@ import (
 // ServiceName must match the identity the mcp-excalidraw CLI checks in /health.
 const ServiceName = "mcp-excalidraw-canvas"
 
-// AI canvas name prefix: every canvas the mcp API manages lives in the host
-// app's `canvases` table with this id prefix, so they all appear in the UI.
+// AI canvas name prefix: canvases created by the MCP API keep this prefix.
+// Existing Workspace scenes can also be addressed directly by canvasId.
 const AICanvasPrefix = "ai-"
 
 type canvasTarget struct {
@@ -42,13 +43,13 @@ type atomicCanvasCreator interface {
 	CreateMCPScene(ctx context.Context, userID, sceneID, collectionID, title string, data []byte) (*core.WorkspaceScene, error)
 }
 
-// canvasState is the in-memory element list for one AI canvas.
+// canvasState is the in-memory element list for one Workspace canvas.
 type canvasState struct {
 	elements map[string]map[string]interface{} // id -> element (agent format)
 	order    []string                          // insertion order
 }
 
-// Store keeps multiple AI canvases in memory (each as canvasState) and
+// Store keeps multiple Workspace canvases in memory (each as canvasState) and
 // persists every mutation to the host app's `canvases` table (native
 // Excalidraw format). Every request names its target canvas explicitly;
 // there is deliberately no process-global "current canvas" shared by users.
@@ -210,9 +211,9 @@ func nativeListToAgentState(elements []map[string]interface{}) *canvasState {
 			if a["id"] == containerID {
 				for _, e := range elements {
 					if e["id"] == textID {
-						if t, ok := e["text"].(string); ok {
-							a["label"] = map[string]interface{}{"text": t}
-						}
+						label := nativeToAgent(e)
+						delete(label, nativeLayoutMarker)
+						a["label"] = label
 						break
 					}
 				}
@@ -275,45 +276,55 @@ func (s *Store) persistCanvasLocked(ctx context.Context, actorUserID, canvasID s
 	}
 	resolveArrowBindings(native)
 
-	var existing struct {
-		AppState map[string]interface{} `json:"appState"`
-		Files    map[string]interface{} `json:"files"`
-	}
+	existing := map[string]interface{}{}
 	var oldData []byte
-	target, ok := s.targets[canvasID]
-	if !ok {
-		return fmt.Errorf("canvas %s has no Workspace binding", canvasID)
+	target, durableTarget := s.targets[canvasID]
+	if s.host != nil {
+		if actorUserID == "" {
+			return core.ErrForbidden
+		}
+		data, err := s.host.GetSceneData(ctx, actorUserID, canvasID)
+		if err != nil {
+			return err
+		}
+		oldData = data
+	} else {
+		if !durableTarget {
+			return fmt.Errorf("canvas %s has no Workspace binding", canvasID)
+		}
+		if err := s.db.QueryRow(`SELECT data FROM canvases WHERE user_id = ? AND id = ?`, target.OwnerUserID, canvasID).Scan(&oldData); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
 	}
-	if err := s.db.QueryRow(`SELECT data FROM canvases WHERE user_id = ? AND id = ?`, target.OwnerUserID, canvasID).Scan(&oldData); err == nil {
+	if len(oldData) > 0 {
 		_ = json.Unmarshal(oldData, &existing)
 	}
-	if existing.AppState == nil {
-		existing.AppState = map[string]interface{}{"viewBackgroundColor": "#ffffff"}
+	appState, _ := existing["appState"].(map[string]interface{})
+	if appState == nil {
+		appState = map[string]interface{}{"viewBackgroundColor": "#ffffff"}
 	}
-	if existing.Files == nil {
-		existing.Files = map[string]interface{}{}
+	files, _ := existing["files"].(map[string]interface{})
+	if files == nil {
+		files = map[string]interface{}{}
 	}
-	scene := map[string]interface{}{
-		"elements":  native,
-		"appState":  existing.AppState,
-		"files":     existing.Files,
-		"thumbnail": "",
+	existing["elements"] = native
+	existing["appState"] = appState
+	existing["files"] = files
+	if _, ok := existing["thumbnail"]; !ok {
+		existing["thumbnail"] = ""
 	}
-	data, err := json.Marshal(scene)
+	data, err := json.Marshal(existing)
 	if err != nil {
 		return err
 	}
 	name := canvasID
-	if n, ok := existing.AppState["name"].(string); ok && n != "" {
+	if n, ok := appState["name"].(string); ok && n != "" {
 		name = n
 	}
 	now := time.Now()
 	// thumbnail must be '' (not NULL): the host app's List scans it into a
 	// string and NULL crashes the whole canvas list.
 	if s.host != nil {
-		if actorUserID == "" {
-			return core.ErrForbidden
-		}
 		clientID := strings.TrimSpace(core.SceneClientIDFromContext(ctx))
 		if clientID == "" {
 			return &core.SceneLockError{Message: "scene write requires a client id"}
@@ -342,6 +353,9 @@ func sceneWriteContext(r *http.Request) context.Context {
 }
 
 func (s *Store) authorizeCanvas(r *http.Request, canvasID string, write bool) error {
+	if strings.TrimSpace(canvasID) == "" {
+		return core.ErrInvalidInput
+	}
 	if s.host == nil {
 		return nil
 	}
@@ -357,6 +371,44 @@ func (s *Store) authorizeCanvas(r *http.Request, canvasID string, write bool) er
 		return core.ErrForbidden
 	}
 	return nil
+}
+
+// loadCanvasLocked returns the current state for an explicit Workspace scene.
+// AI canvases use their durable in-memory state. Ordinary scenes are reloaded
+// from the Workspace store for every request so browser saves and route-level
+// writes cannot leave the incremental CRUD cache stale.
+//
+// The caller must hold s.mu for writing.
+func (s *Store) loadCanvasLocked(ctx context.Context, userID, canvasID string) (*canvasState, error) {
+	canvasID = strings.TrimSpace(canvasID)
+	if canvasID == "" {
+		return nil, core.ErrInvalidInput
+	}
+	if _, durableTarget := s.targets[canvasID]; durableTarget {
+		st := s.canvases[canvasID]
+		if st == nil {
+			return nil, core.ErrNotFound
+		}
+		return st, nil
+	}
+	if s.host == nil {
+		return nil, core.ErrNotFound
+	}
+	if userID == "" {
+		return nil, core.ErrForbidden
+	}
+	data, err := s.host.GetSceneData(ctx, userID, canvasID)
+	if err != nil {
+		delete(s.canvases, canvasID)
+		return nil, err
+	}
+	st, err := s.parseCanvas(data)
+	if err != nil {
+		delete(s.canvases, canvasID)
+		return nil, fmt.Errorf("parse canvas %s: %w", canvasID, err)
+	}
+	s.canvases[canvasID] = st
+	return st, nil
 }
 
 func (s *Store) broadcastToCanvas(canvasID string, msg map[string]interface{}) {
@@ -418,6 +470,9 @@ func (s *Store) create(canvasID string, input map[string]interface{}) map[string
 	}
 	el := make(map[string]interface{}, len(input)+3)
 	for k, v := range input {
+		if k == nativeLayoutMarker || k == resolveBindingsMarker {
+			continue
+		}
 		el[k] = v
 	}
 	el["id"] = id
@@ -446,16 +501,74 @@ func (s *Store) update(canvasID, id string, patch map[string]interface{}) (map[s
 		return nil, false
 	}
 	for k, v := range patch {
-		if k == "id" {
+		if k == "id" || k == nativeLayoutMarker || k == resolveBindingsMarker {
 			continue
+		}
+		if k == "label" {
+			if currentLabel, ok := el[k].(map[string]interface{}); ok {
+				if labelPatch, ok := v.(map[string]interface{}); ok {
+					merged := cloneElementForRead(currentLabel)
+					for labelKey, labelValue := range labelPatch {
+						merged[labelKey] = labelValue
+					}
+					v = merged
+				}
+			}
 		}
 		el[k] = v
 	}
+	if patchRequiresNativeLayoutRebuild(patch) {
+		delete(el, nativeLayoutMarker)
+		for otherID, other := range st.elements {
+			if otherID != id && agentElementReferences(other, id) {
+				delete(other, nativeLayoutMarker)
+			}
+		}
+	}
 	el["updatedAt"] = nowISO()
+	el["updated"] = time.Now().UnixMilli()
 	ver, _ := el["version"].(float64)
 	el["version"] = ver + 1
+	el["versionNonce"] = rand.Intn(2147483647)
 	logrus.WithFields(logrus.Fields{"id": id, "text": el["text"], "label": el["label"]}).Debug("mcpcanvas: update")
 	return el, true
+}
+
+func patchRequiresNativeLayoutRebuild(patch map[string]interface{}) bool {
+	for _, key := range []string{
+		"x", "y", "width", "height", "angle", "points", "label", "text", "fontSize",
+		"start", "end", "startElementId", "endElementId", "startBinding", "endBinding",
+	} {
+		if _, ok := patch[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func agentElementReferences(el map[string]interface{}, elementID string) bool {
+	typ, _ := el["type"].(string)
+	if typ != "arrow" && typ != "line" {
+		return false
+	}
+	for _, key := range []string{"start", "end"} {
+		switch ref := el[key].(type) {
+		case string:
+			if ref == elementID {
+				return true
+			}
+		case map[string]interface{}:
+			if ref["id"] == elementID {
+				return true
+			}
+		}
+	}
+	for _, key := range []string{"startBinding", "endBinding"} {
+		if binding, ok := el[key].(map[string]interface{}); ok && binding["elementId"] == elementID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) remove(canvasID, id string) bool {
@@ -487,7 +600,7 @@ func (s *Store) clearAll(canvasID string) int {
 	return n
 }
 
-// Count returns the total number of elements in bound AI canvases.
+// Count returns the total number of elements in currently loaded canvases.
 func (s *Store) Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -606,15 +719,13 @@ func (s *Store) createCanvas(ctx context.Context, args ...string) (string, error
 }
 
 // mutationCanvasLocked returns the explicit request target. Callers must hold
-// s.mu. A missing canvasId is rejected rather than falling back to shared
-// process state.
-func (s *Store) mutationCanvasLocked(r *http.Request) (string, *canvasState, bool) {
+// s.mu for writing. A missing canvasId is rejected rather than falling back to
+// shared process state; ordinary Workspace scenes are loaded on demand.
+func (s *Store) mutationCanvasLocked(r *http.Request) (string, *canvasState, error) {
 	canvasID := strings.TrimSpace(r.URL.Query().Get("canvasId"))
-	if canvasID == "" {
-		return "", nil, false
-	}
-	st, ok := s.canvases[canvasID]
-	return canvasID, st, ok
+	userID, _ := requestActor(r)
+	st, err := s.loadCanvasLocked(r.Context(), userID, canvasID)
+	return canvasID, st, err
 }
 
 func nativeElementIDs(el map[string]interface{}) []string {
@@ -772,15 +883,15 @@ func (s *Store) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 	actorUserID, _ := requestActor(r)
 	var (
-		canvasOK   bool
+		loadErr    error
 		persistErr error
 	)
 	func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		previous, ok := s.canvases[target]
-		canvasOK = ok
-		if !ok {
+		_, previous, err := s.mutationCanvasLocked(r)
+		if err != nil {
+			loadErr = err
 			return
 		}
 		before := cloneCanvasState(previous)
@@ -790,8 +901,8 @@ func (s *Store) handleSync(w http.ResponseWriter, r *http.Request) {
 			s.canvases[target] = before
 		}
 	}()
-	if !canvasOK {
-		writeErr(w, http.StatusNotFound, "Canvas "+target+" not found")
+	if loadErr != nil {
+		writeAccessErr(w, loadErr)
 		return
 	}
 	if persistErr != nil {
@@ -853,11 +964,12 @@ func (s *Store) handleCanvasSwitch(w http.ResponseWriter, r *http.Request) {
 		writeAccessErr(w, err)
 		return
 	}
-	s.mu.RLock()
-	_, ok := s.targets[id]
-	s.mu.RUnlock()
-	if !ok {
-		writeErr(w, http.StatusNotFound, "Canvas "+id+" not found")
+	userID, _ := requestActor(r)
+	s.mu.Lock()
+	_, err := s.loadCanvasLocked(r.Context(), userID, id)
+	s.mu.Unlock()
+	if err != nil {
+		writeAccessErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "canvasId": id})
@@ -880,6 +992,9 @@ func cloneElementForRead(element map[string]interface{}) map[string]interface{} 
 	}
 	clone := make(map[string]interface{}, len(element))
 	for key, value := range element {
+		if key == nativeLayoutMarker || key == resolveBindingsMarker {
+			continue
+		}
 		clone[key] = cloneValueForRead(value)
 	}
 	return clone
@@ -930,10 +1045,10 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 		writeAccessErr(w, err)
 		return
 	}
-	s.mu.RLock()
-	cur, st, canvasOK := s.mutationCanvasLocked(r)
+	s.mu.Lock()
+	cur, st, loadErr := s.mutationCanvasLocked(r)
 	var all []map[string]interface{}
-	if canvasOK {
+	if loadErr == nil {
 		all = make([]map[string]interface{}, 0, len(st.order))
 		for _, id := range st.order {
 			all = append(all, st.elements[id])
@@ -941,9 +1056,9 @@ func (s *Store) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	// 在锁内深拷贝，锁外序列化拷贝（避免并发 map 读写 panic）
 	all = cloneElementsForRead(all)
-	s.mu.RUnlock()
-	if !canvasOK {
-		writeErr(w, http.StatusBadRequest, "canvasId query param is required and must reference a Workspace-bound AI canvas")
+	s.mu.Unlock()
+	if loadErr != nil {
+		writeAccessErr(w, loadErr)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "elements": all, "count": len(all), "canvasId": cur})
@@ -970,15 +1085,15 @@ func (s *Store) handleCreate(w http.ResponseWriter, r *http.Request) {
 		cur        string
 		el         map[string]interface{}
 		message    map[string]interface{}
-		canvasOK   bool
+		loadErr    error
 		persistErr error
 	)
 	func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		var st *canvasState
-		cur, st, canvasOK = s.mutationCanvasLocked(r)
-		if !canvasOK {
+		cur, st, loadErr = s.mutationCanvasLocked(r)
+		if loadErr != nil {
 			return
 		}
 		before := cloneCanvasState(st)
@@ -991,8 +1106,8 @@ func (s *Store) handleCreate(w http.ResponseWriter, r *http.Request) {
 		// HTTP 响应会在解锁后编码，不能引用可被后续写请求原地更新的 map。
 		el = cloneElementForRead(el)
 	}()
-	if !canvasOK {
-		writeErr(w, http.StatusNotFound, "Canvas "+cur+" not found")
+	if loadErr != nil {
+		writeAccessErr(w, loadErr)
 		return
 	}
 	if persistErr != nil {
@@ -1020,7 +1135,7 @@ func (s *Store) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		cur        string
 		el         map[string]interface{}
 		message    map[string]interface{}
-		canvasOK   bool
+		loadErr    error
 		ok         bool
 		persistErr error
 	)
@@ -1028,8 +1143,8 @@ func (s *Store) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		var st *canvasState
-		cur, st, canvasOK = s.mutationCanvasLocked(r)
-		if !canvasOK {
+		cur, st, loadErr = s.mutationCanvasLocked(r)
+		if loadErr != nil {
 			return
 		}
 		original, exists := st.elements[id]
@@ -1051,8 +1166,8 @@ func (s *Store) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		// HTTP 响应会在解锁后编码，不能引用可被后续写请求原地更新的 map。
 		el = cloneElementForRead(el)
 	}()
-	if !canvasOK {
-		writeErr(w, http.StatusNotFound, "Canvas "+cur+" not found")
+	if loadErr != nil {
+		writeAccessErr(w, loadErr)
 		return
 	}
 	if !ok {
@@ -1078,7 +1193,7 @@ func (s *Store) handleDelete(w http.ResponseWriter, r *http.Request) {
 	var (
 		cur        string
 		deletedIDs []string
-		canvasOK   bool
+		loadErr    error
 		ok         bool
 		persistErr error
 	)
@@ -1086,8 +1201,8 @@ func (s *Store) handleDelete(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		var st *canvasState
-		cur, st, canvasOK = s.mutationCanvasLocked(r)
-		if !canvasOK {
+		cur, st, loadErr = s.mutationCanvasLocked(r)
+		if loadErr != nil {
 			return
 		}
 		original, exists := st.elements[id]
@@ -1104,8 +1219,8 @@ func (s *Store) handleDelete(w http.ResponseWriter, r *http.Request) {
 			s.canvases[cur] = before
 		}
 	}()
-	if !canvasOK {
-		writeErr(w, http.StatusNotFound, "Canvas "+cur+" not found")
+	if loadErr != nil {
+		writeAccessErr(w, loadErr)
 		return
 	}
 	if !ok {
@@ -1136,15 +1251,15 @@ func (s *Store) handleClear(w http.ResponseWriter, r *http.Request) {
 		cur        string
 		n          int
 		message    map[string]interface{}
-		canvasOK   bool
+		loadErr    error
 		persistErr error
 	)
 	func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		var st *canvasState
-		cur, st, canvasOK = s.mutationCanvasLocked(r)
-		if !canvasOK {
+		cur, st, loadErr = s.mutationCanvasLocked(r)
+		if loadErr != nil {
 			return
 		}
 		before := cloneCanvasState(st)
@@ -1155,8 +1270,8 @@ func (s *Store) handleClear(w http.ResponseWriter, r *http.Request) {
 		}
 		message = s.nativeBroadcastMessageLocked("canvas_cleared", nil, cur, nil)
 	}()
-	if !canvasOK {
-		writeErr(w, http.StatusNotFound, "Canvas "+cur+" not found")
+	if loadErr != nil {
+		writeAccessErr(w, loadErr)
 		return
 	}
 	if persistErr != nil {
@@ -1197,15 +1312,15 @@ func (s *Store) handleBatchCreate(w http.ResponseWriter, r *http.Request) {
 		created    []map[string]interface{}
 		response   []map[string]interface{}
 		message    map[string]interface{}
-		canvasOK   bool
+		loadErr    error
 		persistErr error
 	)
 	func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		var st *canvasState
-		cur, st, canvasOK = s.mutationCanvasLocked(r)
-		if !canvasOK {
+		cur, st, loadErr = s.mutationCanvasLocked(r)
+		if loadErr != nil {
 			return
 		}
 		before := cloneCanvasState(st)
@@ -1220,8 +1335,8 @@ func (s *Store) handleBatchCreate(w http.ResponseWriter, r *http.Request) {
 		message = s.nativeBroadcastMessageLocked("elements_batch_created", created, cur, nil)
 		response = cloneElementsForRead(created)
 	}()
-	if !canvasOK {
-		writeErr(w, http.StatusNotFound, "Canvas "+cur+" not found")
+	if loadErr != nil {
+		writeAccessErr(w, loadErr)
 		return
 	}
 	if persistErr != nil {
@@ -1239,18 +1354,18 @@ func (s *Store) handleGet(w http.ResponseWriter, r *http.Request) {
 		writeAccessErr(w, err)
 		return
 	}
-	s.mu.RLock()
-	_, st, canvasOK := s.mutationCanvasLocked(r)
+	s.mu.Lock()
+	_, st, loadErr := s.mutationCanvasLocked(r)
 	var el map[string]interface{}
-	if canvasOK {
+	if loadErr == nil {
 		if orig, ok := st.elements[id]; ok {
 			// 深拷贝，锁外安全序列化
 			el = cloneElementForRead(orig)
 		}
 	}
-	s.mu.RUnlock()
-	if !canvasOK {
-		writeErr(w, http.StatusBadRequest, "canvasId query param is required and must reference a Workspace-bound AI canvas")
+	s.mu.Unlock()
+	if loadErr != nil {
+		writeAccessErr(w, loadErr)
 		return
 	}
 	if el == nil {
@@ -1279,10 +1394,10 @@ func (s *Store) handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		filters[k] = vs[0]
 	}
-	s.mu.RLock()
-	canvasID, st, canvasOK := s.mutationCanvasLocked(r)
+	s.mu.Lock()
+	canvasID, st, loadErr := s.mutationCanvasLocked(r)
 	results := []map[string]interface{}{}
-	if canvasOK {
+	if loadErr == nil {
 		results = make([]map[string]interface{}, 0, len(st.order))
 		for _, id := range st.order {
 			el := st.elements[id]
@@ -1309,9 +1424,9 @@ func (s *Store) handleSearch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	s.mu.RUnlock()
-	if !canvasOK {
-		writeErr(w, http.StatusBadRequest, "canvasId query param is required and must reference a Workspace-bound AI canvas")
+	s.mu.Unlock()
+	if loadErr != nil {
+		writeAccessErr(w, loadErr)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"success": true, "elements": results, "count": len(results), "canvasId": canvasID})
